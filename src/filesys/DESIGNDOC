@@ -1,0 +1,712 @@
+       	       	     +-------------------------+
+                     |          CS 124         |
+                     | PROJECT 6: FILE SYSTEMS |
+                     |     DESIGN DOCUMENT     |
+                     +-------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Sahil Azad <sazad@caltech.edu>
+Winter Pearson <winter@caltech.edu>
+Yakov Shalunov <yakov@caltech.edu>
+
+>> Specify how many late tokens you are using on this assignment: 
+
+3
+
+>> What is the Git repository and commit hash for your submission?
+
+   Repository URL: https://github.com/caltech-cs124-2023sp/cs124-2023sp-seasons
+   commit ...
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+We built our project on top of project 4 with VM functionality enabled, for
+extra credit.
+
+We also implemented sparse files, not sure if that's worth extra credit.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course instructors.
+
+N/A.
+
+		     INDEXED AND EXTENSIBLE FILES
+		     ============================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+We added a type for block sectors for inodes, to be more space-efficient.
+This permits the use of only singly-indirect inodes.
+```c
+/*! The file system is limited to 8 megabytes, so we can use a 16 bit int rather
+    than a 32 bit one to store sector indices. */
+typedef uint16_t fs_sector_t;
+```
+
+We changed the inodes to no longer directly store their data (removed the
+`inode_disk data` field) and added an advisory lock, used to manage simultaneous
+accesses to the same directory.
+```c
+/*! An in-memory struct to store some additional information about an inode.
+    There is guaranteed to be at most one inode with a given value of sector
+    open at any given time, and further references to the same sector use the
+    same object and increase open_cnt. */
+struct inode {
+    ...
+    rwlock_t lock;                      /*!< Advisory lock for the whole file. */
+};
+```
+
+We changed the data stored in each inode to consist of a set of at least 64
+file system sectors, as opposed to a single block sector representing the start.
+```c
+/*! On-disk inode, representing an entry in the file system (file or directory).
+    Contains the information needed to read or write to the entry.
+
+    Direct and indirect nodes sector entries are used to translate logical
+    offsets to the sectors which contain their data.
+    Must be exactly BLOCK_SECTOR_SIZE bytes long. */
+typedef struct inode_disk {
+    inode_header_t header;              /*! The metadata header. */
+    fs_sector_t direct[NUM_DIRECT];     /*! The directly-indexed sectors. */
+    fs_sector_t indirect[NUM_INDIRECT]; /*! Indirect nodes. */
+} inode_disk_t;
+```
+- `direct`: File system sectors indexed directly. We maximize the number of
+these which are available.
+- `indirect`: File system sectors indexed via additional indirect nodes.
+There are always 64 of these and, using two bytes per sector index, this is
+sufficient to not need double indirection. (See question A2 for more details.)
+
+We separated out the header information stored in each inode into a new struct,
+which allows us to add additional fields to the header without needing to
+manually update NUM_DIRECT to keep the size of inode_disk_t correct.
+We also modified the header slightly.
+```c
+/*! A metadata header at the front of an inode. */
+typedef struct inode_header {
+    off_t length;                       /*!< File size in bytes. */
+    unsigned magic;                     /*!< Magic number. */
+    int32_t counter;                    /*!< Counter for external use. */
+} inode_header_t;
+```
+- `counter`: The inode interface provides a generic atomic and persistent 
+counter. In our code, however, much like the advisory lock, this is used only
+for the directory code, which uses the counter to store the number of entries
+in the directory.
+
+When there isn't enough space in an `inode_disk_t` to directly store all the
+sectors, the additional ones are stored in these indirect nodes. There is no
+second layer of indirection.
+```c
+/*! A node used to translate logical offsets to the sectors that convert their
+    information. A single indirect node represents INDIRECT_NUM_DIRECT
+    contiguous sectors of logical offsets, which is a total of
+    BLOCK_SECTOR_SIZE^2 / sizeof(fs_sector_t) bytes. */
+typedef struct indirect_node {
+    fs_sector_t direct[INDIRECT_NUM_DIRECT];    /*! Directly index sectors. */
+} indirect_node_t;
+```
+
+-- Globals --
+
+(All declared in filesys.)
+- `rwlock_t fs_lock`: Removed, since file system synchronization is now handled
+on the inode level.
+- `block_t *fs_device`: Removed, due to switching responsibilities for file
+system block management to `fsdisk.c`.
+
+>> A2: What is the maximum size of a file supported by your inode
+>> structure?  Show your work.
+
+At minimum, we guarantee the support of 8 MiB files. This is done by requiring
+each inode to store 64 indirect nodes. (We assert that this has successfully
+fit into a single sector, as required, so it works.) Part of how we're able to
+do this is the realization that, since the file system is at most 8 MiB and each
+sector is 512 bytes long, we have at most 2^23/2^9 = 2^14 = 16384 sectors on the
+disk and so we can index the disk with 2 byte integers.
+
+The rest of the inode is filled with direct sectors for faster lookup on shorter
+files, but the number of these isn't guaranteed (we just fill the rest of the
+sector with them after whatever is taken up by the header and indirect nodes). 
+As a result, files may be able to be longer than 8 MiB, but the number is
+only slightly larger than 8 MiB (about 8.1 MiB) and not worth computing exactly.
+
+Since sector indices fit in 2 bytes and an indirect sector is 512 bytes long
+and contains only sector indices, each indirect sector stores 512/2 = 256
+sector indices. Files have 64 indirect sectors, so 64 * 256 = 16384 sectors.
+As described above, this is the number of sectors needed to store an 8 MiB
+file.
+
+---- SYNCHRONIZATION ----
+
+>> A3: Explain how your code avoids a race if two processes attempt to
+>> extend a file at the same time.
+There is no specification on what exactly should happen in this case.
+While the spec allows preventing concurrent writes when they are extending the
+file, it does not require this, and it allows arbitrary interleavings of
+concurrent writes otherwise.
+
+Thus, we chose to leverage our implementation of indexed files to allow sparse 
+writes to any logical address, independent of file length. As a result, two
+files writing past the end of the file simultaneously resolves exactly the same
+way that somehow first extending the file to the longer of the two and then
+having them both write would resolve.
+
+After a write is complete, each write will take the max of the current length of
+the file with the highest byte written. Because we do not cache the length of
+the inode outside of the overall disk cache, this max is taken by obtaining the
+cache buffer representing the inode's sector and writing to it. As a result,
+atomicity of the max is guaranteed by the underlying cache implementation.
+
+Thus, since each max is necessarily atomic, we guarantee that the final length
+of the file is the max of the two attempted extensions, as it should be, and any
+concurrent reader will always see either nothing or data from one of the writers
+but will never see uninitialized data.
+
+>> A4: Suppose processes A and B both have file F open, both
+>> positioned at end-of-file.  If A reads and B writes F at the same
+>> time, A may read all, part, or none of what B writes.  However, A
+>> may not read data other than what B writes, e.g. if B writes
+>> nonzero data, A is not allowed to see all zeros.  Explain how your
+>> code avoids this race.
+
+Both process A and B will be able to start the read and write simultaneously.
+When A begins to read, it records the inode length (ie: the file length) which
+it perceives. Process B is permitted to perform its entire write, but only
+updates the inode length to be longer (reflecting the extended file) once the
+write is completed.
+
+Reading and updating the inode length both require getting the `inode_disk_t`
+data for the given inode, and this is done via `fs_cache_get` calls. These are
+synchronized relative to each other, as described in much more detail in section
+C below.
+
+Thus, there are only two possible classes of interleaving: (1) B completes its 
+entire write before A starts its read, so A sees the extended inode length and
+the entirety of the newly extended file, or (2) B is not done with its write by
+the time A starts its read, so A sees the original inode length and so cannot
+read past that point to see the data which B is working on writing. 
+
+>> A5: Explain how your synchronization design provides "fairness".
+>> File access is "fair" if readers cannot indefinitely block writers
+>> or vice versa.  That is, many processes reading from a file cannot
+>> prevent forever another process from writing the file, and many
+>> processes writing to a file cannot prevent another process forever
+>> from reading the file.
+
+The first layer of synchronization encountered when reading from or writing to 
+a file is at the inode layer. When performing `inode_read_at` or
+`inode_write_at`, each process must perform three acts which interact with
+synchronization constructs: identifying the relevant sector of the file,
+examining or updating the file length (as described above), and the actual write
+or read operation with the cache's buffer. They are otherwise allowed to
+interleave. 
+
+This means that the only ways in which readers are differentiated from writers
+are in their accesses to the cache, which locks each entry with a read-write
+lock. Our read-write lock implementation tracks when each waiter blocks. When
+it's time to unblock waiters, if there are both readers and writers blocked
+on it, then there are two cases. If the first write waiter was enqueued before
+the first read waiter, it unblocks the first write waiter. If the first read
+waiter was enqueued before the first write waiter, it unblocks read waiters
+from the front until this is no longer true.
+
+This produces an overall FIFO queue structure, which groups consecutive readers
+into a single request, but does not permit starvation of either readers or
+writers.
+
+---- RATIONALE ----
+
+>> A6: Is your inode structure a multilevel index?  If so, why did you
+>> choose this particular combination of direct, indirect, and doubly
+>> indirect blocks?  If not, why did you choose an alternative inode
+>> structure, and what advantages and disadvantages does your
+>> structure have, compared to a multilevel index?
+
+Our inode structure has only direct and indirect blocks, not doubly indirect
+ones. This is mostly because we realized that we didn't need double indirection,
+as proved in part A1. Removing an additional layer of indirection speeds up
+accesses which would otherwise require going through that indirection, and
+requires fewer sectors to be used per file, both of which are of significant
+benefit. If we used a doubly indirect inode structure, we'd be able to support
+much larger files than we currently are. However, since this was outside of the
+scope required for the project, we didn't consider it to be a significant
+disadvantage to our design.
+
+			    SUBDIRECTORIES
+			    ==============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+We changed our file descriptor map to map FDs to directories as well as files.
+```c
+/*! Represents a mapping between files/directories and userspace `fd`s. */
+typedef struct file_map {
+    void *quick[NUM_QUICK_FILES];    /*!< Array of files for small fds
+                                                 since majority of programs will
+                                                 only open a couple files. */
+    dir_flag_t flags[NUM_QUICK_FILES];    /*!< Whether each is an ordinary
+                                                 file or directory. */
+    list_t overflow;                        /*!< List to store arbitrary number
+                                                 of files beyond quick access. */
+    uint32_t first_open;                    /*!< First available file index slot
+                                                 (fi = fd - NUM_RESERVED_FDS). */
+} file_map_t;
+```
+- `file_t *quick` -> `void *quick`
+- Added `flags`
+
+We now needed the ability to distinguish whether a file descriptor corresponded
+to an ordinary file or a directory. Using a struct with a single bitfield meant
+the `flags` field above would use the minimum memory possible.
+```c
+/*! A flag for whether a given entry is an ordinary file or a directory. */
+typedef struct {
+    char is_dir : 1;    /*!< True for directory, false for ordinary file. */
+} dir_flag_t;
+```
+
+For files which are stored in the overflow list instead of the quick array, we
+similarly changed:
+```c
+/*! Struct for storing files in the overflow list. */
+typedef struct {
+    void *f;                /*!< File to store. */
+    bool is_dir;            /*!< True for directory, false for ordinary file. */
+    list_elem_t elem;       /*!< Intrusive list element. */
+    uint32_t fi;            /*!< The file index, which is the file descriptor
+                                 minus the number of reserved file descriptors. */
+} file_elem_t;
+```
+- `file_t *f` -> `void *f`
+- Added `is_dir` flag
+
+We added an `is_dir` flag to the directory entries to indicate what type of
+file was stored in each, and reworked the entries to be exactly 16 bytes each,
+for sector alignment and memory efficiency reasons.
+```c
+/*! A single directory entry. Designed to be exactly 16 bytes in size. */
+typedef struct dir_entry {
+    char name[NAME_MAX];        /*!< File name. May not have null terminator. */
+    uint16_t inode_sector : 14; /*!< Sector number of header. 8 MiB file system,
+                                    so at most 2^23/512 = 2^14 sectors. */
+    uint16_t in_use : 1;        /*!< In use or free? */
+    uint16_t is_dir : 1;        /*!< Directory or ordinary file? */
+} dir_entry_t;
+```
+
+We added the process's working directory to the thread struct.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+	...
+#ifdef USERPROG
+    /*! Owned by userprog/process.c and userprog/pagedir.c */
+    /**@{*/
+    ...
+    dir_t *wd;                      /*<! Working directory of the process. */
+    /**@{*/
+#endif
+	...
+} thread_t;
+```
+
+Correspondingly, we added the working directory intended for a child process to
+the information struct we utilize during process creation, to allow WD
+inheritance.
+```c
+/*! Info a child process needs to start. */
+typedef struct start_info {
+    ...
+    dir_t *wd;              /*!< The working directory for the child. */
+    ...
+} start_info_t;
+```
+
+---- ALGORITHMS ----
+
+>> B2: Describe your code for traversing a user-specified path.  How
+>> do traversals of absolute and relative paths differ?
+
+There are three kinds of user-specified paths in system calls. In most cases,
+we can make an assumption about what kind of file they must lead to (be it a
+directory or ordinary file), which constitutes two of the cases. The last, more
+difficult case to handle, is when a path may lead to a file or a directory.
+
+Any path which begins with a `/` is assumed to be relative to the root, and
+all other paths are relative to the process's current working directory. In the
+case of the root, the root is opened as a `dir_t`; in the case of the working
+directory, it's already stored as a `dir_t`. This is the current directory. From
+there:
+
+1. *If a path is assumed to be a directory,* it is tokenized by `/` characters.
+The first token is looked up in the current directory and opened as a directory
+itself. The old directory is closed, and the new directory becomes the current
+directory. This is repeated until we run out of tokens (and errors if any
+of the tokens aren't actually directories).
+
+`.` and `..` "directories" are added to each directory at the moment they're
+created, which are sector links to the directory itself and its parent
+directory, respectively. (For root, `..` links to itself as well.) Thus, these
+don't have to be handled as special cases when performing this traversal.
+
+2. *If the path is assumed to be a ordinary file* and the path contains no `/`
+characters, we simply open it in the current directory.
+
+Otherwise, we extract the last `/` character. We require that ordinary file
+paths not end in these, so everything before that is the path to the parent
+directory of the ordinary file. We look this directory up using the same code as
+#1 above. Then, we open an inode for the relevant file, check that we've opened
+an ordinary file, and return it. 
+
+3. *If we don't know what kind of path it is* and it ends in a `/` character,
+we require that it's a directory and look it up as such. Otherwise, we perform
+the same lookup as #2 (which now also has the same guarantee that the path
+doesn't end in a `/`). However, when opening an inode for the relevant file,
+we simply flag whether it was a directory or an ordinary file and then
+return the file.
+
+---- SYNCHRONIZATION ----
+
+>> B4: How do you prevent races on directory entries?  For example,
+>> only one of two simultaneous attempts to remove a single file
+>> should succeed, as should only one of two simultaneous attempts to
+>> create a file with the same name, and so on.
+
+Accesses to a given directory in order to work with its entries are synchronized
+by use of the advisory inode lock. This lock is advisory because files don't
+have to utilize it, but all directory accesses do. It's a read-write lock, so
+it permits synchronization where possible.
+
+If two attempts are made to create or remove the same file from a directory, one
+of them will acquire the inode lock first. This one will then perform the entire
+lookup and creation process before releasing the lock. The next one will then
+acquire the lock, look up the file, and discover that it's already been created
+or deleted and return without changing the directory entries.
+
+>> B5: Does your implementation allow a directory to be removed if it
+>> is open by a process or if it is in use as a process's current
+>> working directory?  If so, what happens to that process's future
+>> file system operations?  If not, how do you prevent it?
+
+No, we do not allow this. We prevent it by keeping track of the number of
+processes which have a given directory open at any time, in each inode. This
+prevents deletion of a directory which is presently in use by another process.
+Additionally, opening or modifying a directory requires acquiring the advisory
+inode lock (see question B4), as does deleting a directory.
+
+This means that, if process A is attempting to delete a directory while process
+B is attempting to open it, only two interleavings are possible. (1) Process A
+acquires the inode lock, sees that it's the only one with the inode (since
+process B is blocked), deletes the directory, and releases the lock. When
+process B acquires the lock, the directory is deleted, so cannot be opened. (2)
+Process B acquires the inode lock first and opens the directory. When process A
+acquires the inode lock, it sees that the inode is in use, and so fails at the
+deletion.
+
+---- RATIONALE ----
+
+>> B6: Explain why you chose to represent the current directory of a
+>> process the way you did.
+
+We represent the current directory of a process as a `dir_t *` pointer, in the
+same manner as other directories are represented throughout the file. This
+means it easily interfaces with existing synchronization constructs (eg:
+preventing deleting that directory, as described in question B5) and our
+directory interface, such as looking up directories from each other.
+
+Since absolute paths can be quite long (we allow them to be up to a page in
+length), we certainly don't want to have to store the path of the working
+directory in memory. Since `..` and `.` are files in each directory, we don't
+need the absolute path of the working directory in order to follow `..` in
+relative paths, so given the ability to not store the full working directory
+path, we chose not to.
+
+			     BUFFER CACHE
+			     ============
+
+---- DATA STRUCTURES ----
+
+>> C1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+We implemented a read-write lock to permit maximally synchronous access to cache
+entries and files.
+```c
+/*! Read-write lock. */
+typedef struct rwlock {
+    /*! The list of threads waiting to get the lock as a reader. */
+    list_t r_waiters;
+    /*! The list of threads waiting to get the lock as a reader. */
+    list_t w_waiters;
+    /*! The number of holders of the lock as readers. Writers are treated as
+        negative, so the value of num_holders ranges from -1 to INT32_MAX. */
+    int32_t num_holders;
+} rwlock_t;
+```
+
+We modified the time stored in the thread struct such that, when the rwlock
+unblocks waiters, it prioritizes the group which blocked first (ie: readers or
+writers), producing FIFO-style behavior. Previously, it was only used to store
+wake up time for threads which called sleep(), but since a thread cannot
+simulatenously block on a lock and sleep, we can use the field for both.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    /**@{*/
+    ...
+    int64_t time;                   /*!< Stores a time. This is used both by the
+                                         sleep mechanism and read write locks. */
+    /**@}*/
+	...
+} thread_t;
+```
+
+Each entry in the cache holds a sector and numerous synchronization constructs
+to ensure synchronized performance of the cache.
+```c
+/*! An entry in the cache. */
+typedef struct cache_entry {
+    hash_elem_t elem;                   /*!< Hash element to insert into cache. */
+    block_sector_t sector;              /*!< The sector this caches. */
+    uint32_t pin_count;                 /*!< The number of users pinning this. */
+    lock_t evict;                       /*!< Lock to be held while evicting. */
+    uint8_t buffer[BLOCK_SECTOR_SIZE];  /*!< The buffer for caching. */
+    rwlock_t lock;                      /*!< Lock used for synchronizing
+                                             reads and writes to the buffer via
+                                             _read/_write/_get. */
+    lock_mode_t lock_mode : 2;          /*!< Whether the entry is locked
+                                             to read (LOCK_READ), locked to 
+                                             write (LOCK_WRITE), or unlocked 
+                                             (LOCK_UNLOCKED).
+                                             */
+    lock_t can_read_lock;               /*!< Lock used to prevent TOCTOU bugs in
+                                             loading the buffer from the disk
+                                             on initial read. */
+    bool can_read;                      /*!< Whether the entry has been loaded
+                                             from disk or overwritten entriely.
+                                             Must be true before reads can be
+                                             made. */
+    uint64_t last_accessed;             /*!< Time this was last accessed, or
+                                             NEVER_ACCESSED. */
+    bool dirty;                         /*!< Whether this cache entry has been
+                                             dirtied. */
+    bool free;                          /*!< Whether the entry is unused. Reads
+                                             and writes are assumed to be
+                                             synchronized with the global lock.*/
+} cache_entry_t;
+```
+- `elem`: See `cache` in Globals and Statics.
+- `buffer`, `sector`: Are the actual data stored in this cache entry.
+- `pin_count`, `evict`: Together, these ensure that a cache entry is only
+evicted when no user has it pinned (ie: is using it in any capacity), and that
+nobody starts trying to use it while it is being evicted.
+- `lock`, `lock_mode`: Synchronizes reads and writes to the buffer. Since the
+user can get access to the buffer, `lock_mode` stores whether they did so
+in order to read or write, so releasing can be handled correctly.
+- `can_read_lock`, `can_read`: Together, used to ensure that the buffer is 
+initialized from disk exactly once, without TOCTOU race conditions, and only if
+necessary (i.e., if we load the cache entry just to overwrite the entire entry,
+we don't load the previous contents from the disk since they'll just be
+overwritten anyway)
+- `last_accessed`: Used in clock-based cache eviction policy. We keep track of
+last_accessed instead of just binary accessed/not accessed to allow for more
+complicated eviction policies, though we didn't get around to implementing one.
+- `dirty`: Used when evicting a cache entry, to know if the buffer needs to
+be written to the disk.
+- `free`: Records whether or not this entry is in use.
+
+Since a user can acquire the buffer for a cache entry, which is locked with
+a read-write lock, when they go to release it, we need to know what mode
+they acquired it in. This enum allows us to store that.
+```c
+/*! The mode of a read/write lock, used to be able to release cache entries
+    generically rather than specifying whether you're releasing as a reader or
+    writer. LOCK_UNLOCKED exists for error checking. */
+typedef enum {
+    LOCK_UNLOCKED = 0,
+    LOCK_READ = 1,
+    LOCK_WRITE = 2,
+} lock_mode_t;
+```
+
+-- Static Variables --
+
+(All belong to fsdisk.)
+- `block_t *device`: The partition which contains the file system
+- `bool cache_closed`: Prevents the write-behind and read-ahead helpers from
+acting after the cache has been destroyed.
+- `hash_t cache`: A hash map between sectors and the cache entries which
+represent them.
+- `lock_t cache_lock`: Manages synchronization of hash map lookups, insertions,
+and deletions.
+- `cache_entry_t entries[]`: Where cache entries are actually stored in memory.
+- `uint8_t free_map_buffer[]`, `block_sector_t free_map_sectors`,
+`bool free_map_dirty`, `lock_t free_map_lock`: Collectively, these manage the
+free map sectors, which are stored separately from the cache and aren't a file.
+- `uint8_t ZERO_BUF[]`: A buffer of all zeros, which is used to make the 
+treatment of sparse files more generic (it is returned if the user asks to read
+from the sector which indicats no sector)
+- `semaphore_t read_ahead_free`, `semaphore_t read_ahead_used`: These keep
+track of the read-ahead queue's free and used spots.
+- `size_t read_ahead_head`, `size_t read_ahead_tail`: These track the locations
+for the next pop and insert in the queue, respectively.
+- `lock_t read_ahead_lock`: Lock for managing the synchronization of the read-
+ahead queue.
+- `block_sector_t read_ahead_queue[]`: Where the read-ahead queue is actually
+stored in memory.
+
+---- ALGORITHMS ----
+
+>> C2: Describe how your cache replacement algorithm chooses a cache
+>> block to evict.
+We use the clock algorithm.
+
+>> C3: Describe your implementation of write-behind.
+When the cache is initialized, it spawns a helper thread which loops forever.
+The body of the loop sleeps for 1/10th of a second and then iterates the entire
+cache. For each entry which it can pin (i.e., each entry not currently being
+evicted), it checks whether it's dirty and, if it is, writes it to the disk.
+
+It also writes the free map to disk if it has been dirtied.
+
+The thread continues until cache_destroy sets a flag which tells it to exit.
+
+>> C4: Describe your implementation of read-ahead.
+A concurrent, fixed-size queue is used to schedule a sector to be read ahead.
+
+The queue implementation is such that enqueues never block (and if the queue is
+full, the enqueue simply fails silently, because reading ahead is not required
+for correctness and if there are that many read ahead requests, chances are the
+requester will just get around to loading it themselves if they do need it) but
+dequeues will block if the queue is empty.
+
+In cache initialization, a read ahead helper thread is spawned. In a loop, this
+thread dequeues the next sector from the queue (thus blocking if there's nothing
+to do for it) and, if it's not already in the cache, loads it into the cache and
+reads it from disk.
+
+When performing a read in inode_read_at, if there is data left in the file, the
+thread will request a read ahead for the sector of the next sector (by logical
+offset addressing) before it performs its own read.
+
+---- SYNCHRONIZATION ----
+
+>> C5: When one process is actively reading or writing data in a
+>> buffer cache block, how are other processes prevented from evicting
+>> that block?
+
+We have a bimodal pinning mechanism which allows entries to be pinned as a
+user or evictor. Our lookup function will always return an entry pinned as user
+and it remains that way until the release function is called. If an entry is
+pinned as a user, it cannot be pinned as an evictor, and our eviction code must
+pin the entry as an evictor before it can begin the eviction process.
+
+>> C6: During the eviction of a block from the cache, how are other
+>> processes prevented from attempting to access the block?
+Our bimodal pinning mechanism prevents the cache entry from being pinned as a
+user if it's pinned by an evictor. If someone needs to access the block while
+it's being pinned as an evictor, they will wait for the evictor to be done and
+then try again (most likely finding that the block doesn't exist and then
+evicting something themselves to make a spot for it).
+
+---- RATIONALE ----
+
+>> C7: Describe a file workload likely to benefit from buffer caching,
+>> and workloads likely to benefit from read-ahead and write-behind.
+Something which uses a single small file, or a specific region of a file, with
+high frequency (or indeed, uses a single file with high frequency at all, since
+either way accesses have to go through the inode), will benefit from buffer
+caching.
+
+For example, I wrote a discord bot which used a file to store settings and,
+because it had a tendency to crash and reboot, and was generally hosted on an
+unreliable machine, so it would immediately write its settings to a file on
+any change; this would be benefit a lot from buffer caching, at least if it
+were the only task using files on the machine.
+
+A program which benefits from read ahead would be one which steps through a file
+while requiring user or network input, which are even slower than the disk.
+Code which sends a file over the network, for example, could benefit from read
+ahead, since while it was waiting for acknowledgement of receipt of one chunk,
+the read ahead would load the next into the cache before it was asked for,
+(though of course a good program could be designed to perform read ahead while
+waiting for network IO on its own). Something like a step debugger could also
+benefit.
+
+Finally, write behind is mostly there to ensure that in the event of failure,
+data is not lost, but any task which involves a lot of writes separated by long
+periods of waiting (e.g., user or network) would benefit from write behind. 
+For example, code receiving a file over the network could write would benefit
+since while it's busy waiting for the next sector, write behind would clean the
+sectors already written so once the cache runs out of sectors their eviction is
+quick.
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future quarters.  Feel free to tell us anything you
+want--these questions are just to spur your thoughts.  You may also
+choose to respond anonymously in the feedback survey on the course
+website.
+
+>> In your opinion, was this assignment, or any one of the three problems
+>> in it, too easy or too hard?  Did it take too long or too little time?
+ Yakov: I think this assignment would benefit from being 3 weeks long, even if it
+comes at the expense of having project 2 be simpler and being 1 week long.
+Especially since it happens near the end of term when things are generally a lot
+busier, but mostly because it is the most complicated project of them all and it
+felt like there's a lot of stuff we could have and wanted to do better but just
+didn't have the time for. For example, we ended up with an eviction policy that
+is just clock, but this project actually lends itself much more to fancier
+eviction policies than VM does because you have full control over accesses and
+don't have to rely on the MMU, plus can afford to have more overhead.
+
+There's generally so much room for interesting flexibility but the required
+tasks already run up pretty hard against the given time.
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+ Yakov: I think some guidance/ideas on how to do synchronization for the cache
+would do well. We ended up with some convoluted synchronization solutions.
+Additionally, the suggested order of implementation should probably explicitly
+say to implement a read/write lock first, and it would be nice to have some
+suggestions on how to do so.
+
+>> Do you have any suggestions for the TAs to more effectively assist
+>> students in future quarters?
+
+>> Any other comments?
+
+ Yakov: Questions A3 and A5 both ask how we acheived things that the spec
+doesn't say we need to acheive.
+
+ Winter: This design doc doesn't have a question B3; it goes B1, B2, B4, B5, B6.

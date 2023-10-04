@@ -1,0 +1,637 @@
+			+--------------------+
+			|       CS 124       |
+			| PROJECT 2: THREADS |
+			|   DESIGN DOCUMENT  |
+			+--------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Sahil Azad <sazad@caltech.edu>
+Winter Pearson <winter@caltech.edu>
+Yakov Shalunov <yakov@caltech.edu>
+
+>> Specify how many late tokens you are using on this assignment:
+
+0
+
+>> What is the Git repository and commit hash for your submission?
+   (You only need to include the commit-hash in the file you submit
+   on Moodle.)
+
+   Repository URL: https://github.com/caltech-cs124-2023sp/cs124-2023sp-seasons
+   commit ...
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course instructors.
+
+			      THREADS
+			      =======
+
+---- LOGISTICS ----
+
+These questions will help us to keep track of the difficulty level of
+assignments, as well as keeping track of which team members worked on
+which parts.
+
+>> L1: How many hours did each team member spend on this assignment?
+   Make sure that each member's total time is listed.
+
+- *Sahil:* 6 hours
+- *Winter:* 6 hours
+- *Yakov:* 16 hours
+
+>> L2: What did each team member focus on for this assignment?  Keep
+   descriptions to 25-30 words or less.
+
+- *Sahil:* Priority donation design, priority scheduling, ready queues, and framework for advanced scheduler
+- *Winter:* Priority donation design, condition variables, and advanced scheduler calculations
+- *Yakov:* Alarm clock, priority donation design and implementation, and fixed point library
+
+			     ALARM CLOCK
+			     ===========
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+The thread struct was modified quite intensively. We've omitted the fields not
+used by alarm clock or not modified.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    /**@{*/
+    ...
+    long long wakeup_ticks;             /*!< Global ticks at which to wakeup. */
+    ...
+    /**@}*/
+	...
+} thread_t;
+```
+
+- `wakeup_ticks`: stores the global tick count at which the thread should
+	wake up. If the thread is not sleeping, the field is undefined.
+
+-- Globals --
+- Moved the `ticks` global variable from `timer.c` to `thread.c`
+- `static list_t sleeping_list;`: list of sleeping threads, sorted in order of
+	when they should wake up, to re-ready threads once they've slept.
+
+---- ALGORITHMS ----
+
+>> A2: Briefly describe what happens in a call to timer_sleep(),
+>> including the effects of the timer interrupt handler.
+timer_sleep() invokes thread_sleep(). thread_sleep() computes the tick on which
+the thread should wake up, saves it in the current threads `.wakeup_ticks`
+field, and then inserts it into the `sleeping_list`, which is maintained as
+sorted such that the head has the lowest value of `.wakeup_ticks`.
+
+The interrupt handler is unchanged, except that `ticks++` has been moved from
+`timer_tick()` in `timer.c` to `thread_tick()` in `thread.c`.
+
+>> A3: What steps are taken to minimize the amount of time spent in
+>> the timer interrupt handler?
+Since threads that sleep are not given a guarantee of waking up immediately and
+only need to wake up after the specified time, the head of the `sleeping_list`
+is checked against the current time inside `schedule()`.
+
+Additionally, the list is kept sorted, which means the expensive operation
+(ordered list insert) is done inside the `_sleep` call itself, and the scheduler
+only has to do the cheap operation of peeking the head of the list.
+
+---- SYNCHRONIZATION ----
+
+>> A4: How are race conditions avoided when multiple threads call
+>> timer_sleep() simultaneously?
+
+`thread_sleep()` disables interrupts until it reaches `thread_block()`, which
+invokes the scheduler, so multiple threads cannot be in the critical section
+simulataneously.
+
+>> A5: How are race conditions avoided when a timer interrupt occurs
+>> during a call to timer_sleep()?
+Interrupts are disabled in `thread_sleep()`.
+
+---- RATIONALE ----
+
+>> A6: Why did you choose this design?  In what ways is it superior to
+>> another design you considered?
+
+This design minimizes any form of overhead. We get away with only a single field
+in the thread struct, we don't context switch away from a thread which is about
+to yield anyway, we don't run any code inside the interrupt handler.
+
+We could have used a semaphore to protect the sleeping threads list, and used
+`sema_try_down`, but decided that this approach was cleaner and faster.
+
+			 PRIORITY SCHEDULING
+			 ===================
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+We threw typedefs for brevity on more or less every type we were using:
+- `struct list` -> `list_t`
+- `struct list_elem` -> `list_elem_t`
+- `struct bitmap` -> `bitmap_t`
+- `struct semaphore` -> `semaphore_t`
+- `struct lock` -> `lock_t`
+- `struct condition` -> `condition_t`
+- `struct thread` -> `thread_t`
+
+We changed the condition_t struct to be:
+```c
+/*! Condition variable. */
+typedef struct condition {
+    semaphore_t semaphore;      /*!< Semaphore which threads wait on. */
+} condition_t;
+```
+because we rewrote it to an implementation utilizing a single semaphore.
+
+We changed the lock_t struct to be:
+```c
+/*! Lock. */
+typedef struct lock {
+    struct thread *holder;      /*!< Thread holding lock (for debugging). */
+    semaphore_t semaphore;      /*!< Binary semaphore controlling access. */
+    int priority;               /*!< Max priority of threads blocking on lock. */
+    list_elem_t elem;           /*!< List element for threads to hold. */
+} lock_t;
+```
+The `priority` and `elem` fields are for priority donation. `elem` is for
+threads to recalculate their donated priority when they unlock a lock.
+
+The thread struct was modified quite intensively. We've omitted the fields not
+used by priority scheduling or not modified.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    /**@{*/
+    ...
+    int base_priority;                  /*!< Priority without donations. */
+    ...
+    /**@}*/
+
+    /*! Shared between thread.c and synch.c. */
+    /**@{*/
+	...
+    list_t held_locks;                  /*!< List of all locks held by thread. */
+    lock_t *blocked_on;            		/*!< Lock the thread is currently
+                                             blocked on or NULL. */
+    /**@}*/
+	...
+} thread_t;
+```
+
+- `base_priority`: stores the base priority of the thread before any donations
+	are applied.
+- `held_locks`: used to calculate the maximum priority of held locks to
+	determine what the threads donated priority should be when releasing a lock
+- `blocked_on`: used to forward priority donations in cases of nesting.
+
+```c
+#define PRI_CNT (PRI_MAX - PRI_MIN + 1)
+/*! Struct holding the PRI_MAX-PRI_MIN + 1 ready queues*/
+typedef struct ready_queue {
+    list_t queues[PRI_CNT];        /*!< Array of queues threads by priority. */
+    bitmap_t *populated_queues;    /*!< Bitmap of queue emptiness. */
+    ...
+    /*! Buffer to store the populated queues bitmap. */
+    char bitmap_buf[BITMAP_BUF_SIZE(PRI_CNT)];
+} ready_queue_t;
+```
+The struct represents the ready thread priority queue. Advanced scheduler fields
+have been omitted here.
+- `queues`: an array of lists for each priority, each a FIFO queue
+- `populated_queues`: a bitmap of which queues are populated for faster lookup
+	of the highest priority non-empty queue.
+- `bitmap_buf`: buffer to place `populated_queues` into to avoid allocating any
+	memory unnecessarily/during initialization.
+
+-- Globals --
+- `ready_list` changed to `ready_queue`, an instance of `ready_queue_t`
+
+>> B2: Explain the data structure used to track priority donation.
+>> Use ASCII art to diagram a nested donation.  (Alternately, submit a
+>> .png file.)
+
+Each thread keeps track of both the lock its blocked on and all locks it holds
+and each lock keeps track of both its holder and all threads blocking on it.
+
+This means that priority donation is tracked with what is effectively a doubly-
+linked tree with layers alternating nodes of type `thread_t` and `lock_t`.
+
+Let `A` and `B` refer to locks and `L`, `M`, and `H` refer to threads. Then we
+would have
+        --- holds --->     -- blocks -->     --- holds --->     -- blocks -->
+    [L]                [A]               [M]                [B]               [H]
+        <- locked by -     <- waits on -     <- locked by -     <- waits on -
+
+---- ALGORITHMS ----
+
+>> B3: How do you ensure that the highest priority thread waiting for
+>> a lock, semaphore, or condition variable wakes up first?
+We rewrote condition variables to use a single semaphore, so all three use the
+same code. Whenever a semaphore is upped, we iterate the list of waiters and pop
+the highest priority thread.
+
+>> B4: Describe the sequence of events when a call to lock_acquire()
+>> causes a priority donation.  How is nested donation handled?
+When `lock_acquire` is called on a lock which is already held, it invokes
+`lock_gained_priority_donor()`. This "informs" the lock that it has a new source
+of priority equal to the current priority of the thread trying to acquire the
+lock (including any donations that thread has). If the priority is higher than
+lock's priority, the lock increases its priority and the calls
+`thread_gained_priority_donor()` on the thread holding the lock. If the thread
+wasn't already higher priority, this increases the priority. If the thread's
+priority was increased, it proceeds to invoke a helper which either bumps it up
+in the ready queue is it's ready and waiting or again invokes
+`lock_gained_priority_donor()` on whichever lock it's blocked on, if such a lock
+exists. Thus, nested donation is simply handled by the mutual recursion of
+`thread_` and `lock_gained_priority_donor()`.
+
+>> B5: Describe the sequence of events when lock_release() is called
+>> on a lock that a higher-priority thread is waiting for.
+Whenever a thread releases a lock, `thread_lost_priority_donor()` is invoked
+on that thread. If the size of the lost donation is less than the current
+priority, the call does nothing. However, if the thread is otherwise lower
+priority than one of the threads waiting on the lock (as in this case),
+the thread recalculates its priority by taking the max over all the locks
+it holds and its base priority. If this causes it to decrease its priority, it
+invokes `thread_yield_if_lost_primacy()`, which checks the threads new priority
+against the highest priority thread in the ready queue and, if the running
+thread is not highest, yields. In this case, the just-released thread would have
+higher priority and so the thread would yield after recalculating its priority.
+
+---- SYNCHRONIZATION ----
+
+>> B6: Describe a potential race in thread_set_priority() and explain
+>> how your implementation avoids it.  Can you use a lock to avoid
+>> this race?
+Suppose a thread [X] holds lock [A], which currently has nobody blocking on it,
+and has priority of `PRI_MAX`.
+Consider the following sequence of events:
+- [X] invokes `thread_set_priority(PRI_MIN)`, setting its base priority and
+    beginning to recalculate its new correct priority. It gets through checking
+    its list of held locks and concludes that the min is `PRI_MIN`.
+- An interrupt occurs and thread [Y], also of priority `PRI_MAX`, runs
+- [Y] blocks on [A]. This sets the priority of [A] to `PRI_MAX` which tells
+    [X] that it gained a donor of `PRI_MAX`. However, [X] still has a priority
+    of `PRI_MAX` because only its base priority has been updated, and so [X]
+    ignores this.
+- [Y] blocked, so the scheduler is invoked and, thread [X], which still has
+    priority `PRI_MAX`, runs again.
+- [X] sets its priority to the result is computed before it was interrupted,
+    which is `PRI_MIN` and checks if there's a higher priority thread.
+- [Z], which has priority `PRI_DEFAULT`, is scheduled and runs indefinitely,
+    even though [Y] has higher priority and is blocked on [X], since [X] has
+    incorrect priority due to race condition.
+
+This cannot be solved with a lock because it is caused by priority donation and
+inserting more locks would lead to infinite recursion. Instead, it must be
+solved by turning interrupts off while setting priority.
+
+---- RATIONALE ----
+
+>> B7: Why did you choose this design?  In what ways is it superior to
+>> another design you considered?
+
+The key questions in the design were
+- How do we handle the ready queue?
+- How do we handle blocked threads?
+- How do we handle priority donation?
+
+For the ready queue, fundamentally, it is simply a priority queue with the
+constraints that priority has granularity constraints and that within a fixed
+priority it must behave as a FIFO queue.
+
+The simplest data structure with this behavior is a collection of
+`PRI_MAX - PRI_MIN + 1` individual FIFO queues. This data structure has a number
+of advantages in this situation:
+- Enqueue is O(1)
+- Simple and thus easy to implement with few bugs
+- Easy to remove an element from its current place and reinsert it if its
+    priority increases.
+
+Furthermore, while dequeuing requires potentially iterating over all the queues,
+the speed of dequeuing actually increases as the number of threads increases
+because it increases the likelihood of a high priority queue having something
+in it.
+
+We accompanied this with a bitmap to track which queues are empty, which doesn't
+improve asymptotic time complexity, but should speed up the iterating by
+limiting the number of memory accesses to two, adjacent, 32 bit words.
+
+The other options in this case are:
+- an unsorted list, which also gives O(1) insertion but makes retreival slower;
+- a sorted list, which would have inserting elements expensive and retreiving
+    them cheaper, but since we need to update the priorities of elements in the
+    queue sometimes but only dequeue at most once per
+    enqueue, this was deemed a bad tradeoff; and finally,
+- a heap, however, this would have required inventing/finding a heap
+    implementation which preserves FIFO order within a priority, made insertion
+    slower, and since we only have a handful of priorities, likely made dequeue
+    also slower, since for small `n` asymptotic performance is irrelevant and
+    for large `n`, our implementation is technically O(1) due to constant and
+    small number of distinct priorities.
+    Furthermore, it would have greatly increased the complexity of the code.
+
+For the blocked threads, the arguments to not have a sorted list or heap are the
+exactly the same as with ready threads, with the additional caveat that we do
+not expect anywhere close to as many threads blocking on a single lock, which
+excacerbates the issues with a heap. The fact that we only expect to have a few
+threads blocked on a given semaphore means that a tiered priority queue like for
+ready threads would be wasteful since we would expect the vast majority of
+the priorities to be empty.
+
+The unsorted list has a secondary advantage here: It means that when a thread's
+priority changes, nothing needs to be done, which greatly simplifies the code
+and reduces the odds of bugs. On the advanced scheduler, this is also a large
+performance factor, since every thread's priority potentially changes every 4
+clock ticks.
+
+Finally, our choice of handling for priority donation is based on the
+constraints of the problem. The tree we effectively store is strictly required
+in order to be able to correctly calculate the priority of a thread when it
+releases a lock but still holds other locks. Since we need that much, the
+algorithm we chose always us to avoid any additional information or external
+data structures.
+
+We chose to calculate priority donation recursively rather than iteratively
+because it is much simpler, and thus easier to write in a bug free way. This is
+doubly true because the solution requires two types of propogation, which is
+cleanly done through mutual recursion but would be messy with iteration.
+
+			  ADVANCED SCHEDULER
+			  ==================
+
+---- DATA STRUCTURES ----
+
+>> C1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+`typedef int32_t fp_val;`
+The `fp_val` type represents a fixed point real value and is an `int32_t` alias
+for readability.
+
+The thread struct was modified quite intensively. We've omitted the fields not
+used by advanced scheduling or not modified.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    /**@{*/
+    ...
+    int nice;                           /*!< Thread's niceness value. */
+    fp_val recent_cpu;                  /*!< Metric of CPU time used recently. */
+    ...
+    /**@}*/
+} thread_t;
+```
+
+- `nice`: the thread's 'nice' value as defined for the advanced scheduler.
+- `recent_cpu`: fixed point real number representing recent cpu usage of the
+	thread, as defined in the advanced scheduler.
+
+```c
+#define PRI_CNT (PRI_MAX - PRI_MIN + 1)
+/*! Struct holding the PRI_MAX-PRI_MIN + 1 ready queues*/
+typedef struct ready_queue {
+    ...
+    size_t num_ready_threads;      /*!< Threads running or ready to be run.
+                                        (Excluding idle.) */
+    ...
+} ready_queue_t;
+```
+The struct represents the ready thread priority queue. Advanced scheduler fields
+only.
+
+- `num_ready_threads`: total number of threads in the queue, for computing
+	load_avg for advanced scheduler
+
+-- Globals --
+- `static fp_val load_avg`: the current load average on the CPU, as defined in
+	the advanced scheduler.
+
+
+---- ALGORITHMS ----
+
+>> C2: Suppose threads A, B, and C have nice values 0, 1, and 2.  Each
+>> has a recent_cpu value of 0.  Fill in the table below showing the
+>> scheduling decision and the priority and recent_cpu values for each
+>> thread after each given number of timer ticks:
+
+timer  recent_cpu    priority   thread
+ticks   A   B   C   A   B   C   to run
+-----  --  --  --  --  --  --   ------
+ 0      0   0   0  63  61  59     A
+ 4      4   0   0  62  61  59     A
+ 8      8   0   0  61  61  59     A
+12      12  0   0  60  61  59     B
+16      12  4   0  60  60  59     B
+20      12  8   0  60  59  59     A
+24      16  8   0  59  59  59     A
+28      20  8   0  58  59  59     C
+32      20  8   4  58  59  58     B
+36      20  12  4  58  58  58     B
+
+>> C3: Did any ambiguities in the scheduler specification make values
+>> in the table uncertain?  If so, what rule did you use to resolve
+>> them?  Does this match the behavior of your scheduler?
+
+It's not strictly clear in the scheduler specification whether or not recent_cpu
+should be recalculated when ticks is 0. Our implementation chooses not to, since
+it increments `ticks` before checking if recent_cpu should be recalculated.
+Therefore, consistent with this, the table uses the initial values of recent_cpu
+and does not recalculate them immediately.
+
+It's also not necessarily clear if recent_cpu should be incremented before or
+after priority is recalculated. Our implementation performs the increment before
+the priority calculation, and the table reflects this.
+
+Additionally, if the currently running thread becomes tied in priority with
+another (such as at tick 8 in the table), our implementation does not have it
+yield immediately and only begins the round robin process subsequently. Thus, A
+retains primacy in the table at tick 8.
+
+Finally, the order in the round robin queue is governed by time in that queue,
+where threads which have more recently gained that priority are at the back.
+Hence, at tick 28, thread C has seniority over thread B.
+
+>> C4: How is the way you divided the cost of scheduling between code
+>> inside and outside interrupt context likely to affect performance?
+
+We chose to recalculate thread priorities within an interrupt context every
+4 ticks (which is the time slice given to each thread) and recalculate
+each threads recent cpu usage each 100 ticks within thread_tick. As such,
+each timer tick, which causes an interrupt, performs a constant time check
+to determine whether priorities and/or cpu usages have to be recalculated,
+and then enfore preemption as needed (determining whether the current thread
+must yield after the interrupt has completed or not). While it could be slightly
+more efficient to only update the priorities of currently running threads
+and threads which ran so recently that their cpu usage/priorities could
+have had a relatively high likelihood to have changed from the previous priority
+calculation (which will handle most cases with nearly correct priorities), we
+chose to accept the slightly increased time required to recalculate all priorities
+at every 4th and 100th tick rather than have slowly accumulating drifts in
+calculated priorities for threads and store a subset of threads which have to
+be recalculated.
+
+Since the only things performed for scheduling not within an interrupt is
+selection of the next highest priority thread to be run  (a linear time pop
+operation) assuming the previous thread either yielded due to preemption
+or because a higher priority thread was created in the most recent interupt,
+and updating a bitmap atomically, the amount of time taken away
+from each thread in its time slice is minimal. Thus our scheduling requires
+additional time within interrupts to perform preemption, priority
+calculations (including moving threads in the priority queues if needed),
+and recent cpu usage calculations, but maximizes thread performance within
+allocated time slices by minimizing overhead for scheduling outside of interrupts.
+
+---- RATIONALE ----
+
+>> C5: Briefly critique your design, pointing out advantages and
+>> disadvantages in your design choices.  If you were to have extra
+>> time to work on this part of the project, how might you choose to
+>> refine or improve your design?
+
+Our design stores within our ready_queue struct a bitmap of queues
+populated with ready threads. As such, we have constant time lookups for ready
+thread dequeue since the bitmap can be modified atomically if needed to
+reset the highest priority bit if the highest priority queue changes.
+However, this does require updating the bitmap during priority changes and
+enqueuing ready threads. Additionally we use the provided doubly-linked
+list struct for each ready queue, providing constant time enqueue and dequeue
+from each ready queue. As described in Section B7, our approach provides a highly
+efficient method of adding, removing and bumping threads from the ready
+queue as needed, while adding relatively little overhead by using a bitmap
+to circumvent iteration through the entire set of 64 priority queues to identify
+the highest populated queue.
+
+Additionally, we chose to store the number of ready threads at any
+given time in our ready_queue struct, which (though it requires us to
+keep the number of ready threads updated during enqueue, dequeue and thread
+completion) reduces the overhead required for computing load_avg since
+it does not require iteration through the ready queues to identify the
+number of ready threads at any given moment. Given the relatively low
+amount of code and overhead required to store the number of ready threads,
+this is almost a trivial tradeoff to make.
+
+If given more time, we may have attempted to use or invent an ordered
+max heap implementation to replace the 64 ready queues, since then we could
+reheapify the ready threads when priorities are recalculated, instead of
+manually updating each one's position.
+
+Additionally, we could have done some form of lazy updating for priority
+recalculation to avoid having to iterate the entire list of threads every 4
+ticks within the interrupt handler. However, we're not sure how exactly that
+would be made to work and it seems complicated to do lazy calculations in a way
+that complies with the strict constraints on exactly when priorities and cpu
+usage are recalculated. While deviations from this exact spec would probably
+make for a perfectly good operating system, they would fail the tests.
+
+Because there can be many threads asleep, it would probably be good to use some
+sort of heap data structure, or hybrid heap/list to have better behavior at
+small amounts than a heap. The sleeping threads list could also be checked at
+most once per tick, rather than in every schedule call, though since the check
+is just a peek because the list is kept ordered, this would be a minor
+optimization at best.
+
+Similarily, the semaphore waiter threads woudld ideally be stored in some hybrid
+data structure, maybe including a small fixed-size array since the majority of
+semaphores will never have more than a couple waiters, and an overflow heap or
+list for semaphores with large numbers of waiters.
+
+Ideally, priority donation propogation would be done by iterative traversal
+rather than recursive, since iteration is generally faster and we have very
+little stack space to work with.
+
+>> C6: The assignment explains arithmetic for fixed-point math in
+>> detail, but it leaves it open to you to implement it.  Why did you
+>> decide to implement it the way you did?  If you created an
+>> abstraction layer for fixed-point math, that is, an abstract data
+>> type and/or a set of functions or macros to manipulate fixed-point
+>> numbers, why did you do so?  If not, why not?
+
+We chose to implement an abstract type and a library on the basis that many of
+the operations are finicky and the correct way to do them is both ugly and
+inconsistent across the operations. Therefore, manually performing the
+operations everywhere we needed them would have been incredibly bug prone,
+especially with nested expressions, not to mention ugly.
+
+By wrapping the fixed point values in a struct which isn't an arithmetic type,
+we ensure there are no errors from accidentally treating them as regular
+numerical types.
+
+			  SURVEY QUESTIONS
+			  ================
+
+Answering these questions is optional, but it will help us improve the
+course in future years.  Feel free to tell us anything you want - these
+questions are just to spur your thoughts.  Also, feel free to be completely
+honest if there are issues with the assignment or the course - you won't be
+penalized.  We can't fix things until we know about them.  :-)
+
+>> In your opinion, was this assignment, or any of the parts of it, too
+>> easy or too hard?  Did it take too long or too little time?
+
+Winter: No, it was reasonable.
+Sahil: Both difficulty and time were within expectations.
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+Winter: The work to figure out how to manage priority donation such that no
+thread could become blocked felt particularly insightful, and was logistically
+interesting to think about how to manage.
+Sahil: Handling the thread priorities within the queues was quite interesting,
+both in terms of the simplicity of how the queue strucuture worked and how
+efficient thread handling is with even a simple scheduler.
+
+>> Were there any parts of the assignment that you felt were unnecessarily
+>> tedious or pointless?
+
+Winter: Not in paritcular.
+Sahil: All parts of the project were interesting without being tedious.
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+Winter: The FAQ for priority donation didn't address many of the edge cases that
+we were considering, and it took some time to work out if they were possible or
+not. If that's purposeful, then it's reasonable to have not included it, but it
+seemed a little unusual that the FAQ addressed the simpler parts.
+Sahil: The guidance provided was helpful and provided enough foundational help
+such that there always felt like a path forward, but also enough room to come
+up with our own design decisions. The current guidance seems to be well balanced
+in both quantity and depth.
+
+>> Do you have any suggestions for the instructor and/or TAs to more
+>> effectively assist students, either for future quarters or the remaining
+>> projects?
+
+Winter: It was difficult to find all of the information relevant to the project,
+since it's spread across so many different pages on the spec. If some of it could
+be consolidated or if there was a way to search the entire spec, that would be
+useful!
+
+>> Any other comments?
+
+Nope!

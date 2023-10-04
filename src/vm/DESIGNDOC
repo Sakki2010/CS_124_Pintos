@@ -1,0 +1,553 @@
+       	       	    +---------------------------+
+                    |           CS 124          |
+                    | PROJECT 5: VIRTUAL MEMORY |
+                    |      DESIGN DOCUMENT      |
+                    +---------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Sahil Azad <sazad@caltech.edu>
+Winter Pearson <winter@caltech.edu>
+Yakov Shalunov <yakov@caltech.edu>
+
+>> Specify how many late tokens you are using on this assignment:  
+
+>> What is the Git repository and commit hash for your submission?
+   (You only need to include the commit-hash in the file you submit
+   on Moodle.)
+
+   Repository URL: https://github.com/caltech-cs124-2023sp/cs124-2023sp-seasons
+   commit ...
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+We implemented an eviction policy which is a slightly upgraded version of aging,
+which uses a clock-hand to tie-break between frames of equal age.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course instructors.
+
+---- LOGISTICS ----
+
+These questions will help us to keep track of the difficulty level of
+assignments, as well as keeping track of which team members worked on
+which parts.
+
+>> L1: How many hours did each team member spend on this assignment?
+   Make sure that each member's total time is listed.
+
+- *Sahil:* 6 hours
+- *Winter:* 20 hours
+- *Yakov:* 40 hours
+
+>> L2: What did each team member focus on for this assignment?  Keep
+   descriptions to 25-30 words or less.
+
+- *Sahil:* Design of supplemental page table
+- *Winter:* Design of supplemental page table, overall design, supplemental page
+   table, frame table, page loading, and miscellaneous debugging.
+- *Yakov:* Design of supplemental page table; swap table; supplemental page table;
+   eviction mechanism; eviction policy; synchronization; so, so, so much debugging;
+   redesign and rewrite of the supplemental page table to be worse and simpler;
+   aging.
+
+Note that this design document is a bit long.  Most of the questions can be
+answered pretty briefly.  Don't feel a need to write a long answer if it is
+not required by the question.
+
+			PAGE TABLE MANAGEMENT
+			=====================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+The thread struct was modified to use a supplemental page table instead of
+directly accessing the page table, and to store a stack pointer for use
+in some page faults. Unmodified fields omitted.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    ...
+#ifdef USERPROG
+    /*! Owned by userprog/process.c and userprog/pagedir.c */
+    /**@{*/
+    sup_pagetable_t pt;             /*!< Page table. */
+    ...
+    void *stack_pointer;            /*!< The stack pointer of the user process,
+                                         if executing a syscall. */
+    /**@{*/
+#endif
+   ...
+} thread_t;
+```
+
+Memory-efficient and lightweight semaphore, able to be held in a single pointer.
+Used by the supplemental page table and the frame table, to minimize
+synchronization overhead.
+```c
+/*! A fast, memory efficient binary semaphore.
+    Releases waiters in LIFO order.
+
+    Uses the fact that thread structs are always page-aligned to store data in
+    the lower 12 bits of a pointer. */
+typedef struct bin_sema {
+    uintptr_t data;
+} bin_sema_t;
+```
+
+Our eviction policy is a form of aging. For readability's sake, this represents
+the age of a frame.
+```c
+typedef uint8_t age_t;
+```
+
+The frame table, utilized in place of a bitmap by `palloc`'s `user_pool`
+to allocate actual underlying frames in user space memory.
+```c
+/*! Frame table. Stores mappings from each frame to user space pages which
+    are loaded into them. */
+typedef struct frametbl {
+    size_t num_frames;  /*!< The number of user-space frames. */
+    list_t unused;      /*!< A list of frames without pages loaded into them. */
+    lock_t lock;        /*!< Lock for manipulating the frame table. */
+    void *base;         /*!< The start of the user-space frames. */
+    fte_t tbl[];        /*!< Table of frame table entries. */
+} frametbl_t;
+```
+
+Subsequently, we also modified the pool struct to allow using a frame table
+as well as a bitmap. Unmodified entries ommitted.
+```c
+/*! A memory pool. */
+typedef struct pool {
+    ...
+    void *used_map;            /*!< Acquires free pages (bitmap or frametbl). */
+    ...
+} pool_t;
+```
+
+A single entry in the frame table, designed to be as lightweight as possible.
+(The list element for unused pages is placed *inside* the frame itself, not
+in the entry, to conserve memory.)
+```c
+/*! Frame table entry, indicating what pages are loaded into each frame. */
+typedef struct fte {
+    vm_mapping_t *mapping;  /*!< The mapping which owns the frame. */
+    bin_sema_t lock;        /*!< For pinning a frame, to prevent its eviction. */
+    age_t age;              /*!< The "age" of the frame for aging. The lowest
+                                 age gets evicted. */
+} fte_t;
+```
+
+Since there are many kinds of `void *` pointers in this project, for readability
+we added a struct representing a single frame in physical memory.
+```c
+/*! Representation of a single frame. */
+typedef struct frame {
+    uint8_t bytes[PGSIZE];
+} frame_t;
+```
+
+The supplemental page table consists of a hash map of entries (or mappings),
+describing memory as the user believes it to be.
+```c
+/*! Supplemental page directory. Represents a user process's view of memory:
+    when a page fault occurs, the handler consults the supplemental page
+    directory to determine how to handle it. */
+typedef struct sup_pagetable {
+    bool user;          /*!< Boolean flag indicating whether to not use the
+                                 default kernel page table. */
+    uint32_t *pd;       /*!< The hardware page directory, augmented using
+                                 the available free bits. */
+    hash_t mappings;    /*!< Stores a mapping between addresses and files
+                                 for memory mapped files. */
+} sup_pagetable_t;
+```
+
+Each mapping is an entry in the supplemental page table, describing the user's
+belief about what is present in the corresponding page. Aims to be extremely
+lightweight for memory.
+```c
+*! Represents what a virtual page should contain. */
+struct vm_mapping {
+    hash_elem_t elem;   /*!< Element to insert in hash. */
+    void *page;         /*!< Address being mapped from. */
+    bin_sema_t lock;    /*!< Page lock. */
+    int present : 1;    /*!< this address is currently mapped. */
+    int writable : 1;   /*!< this mapping is writable. */
+    int hasfile : 1;    /*!< this is a file-backed mapping. */
+    int fwrite : 1;     /*!< the backing file can be written to. */
+    int map_start : 1;  /*!< this is the start of a file mapping. */
+    int orphaned : 1;   /*!< this mapping is unmapped and should be freed when
+                             it is next evicted. */
+    int swapped : 1;    /*!< Whether the page has been swapped. If it is not
+                             present, data.swap_slot indicates the slot. */
+    int isstack : 1;    /*!< Whether the page is a stack page. */
+    sup_pagetable_t *pt;/*!< The page table this mapping belongs to, if orphaned
+                             is false. Undefined if orphaned is true. */
+    frame_t *frame;     /*!< The frame currently mapped to. 
+                             Undefined if present and orphaned are false. */
+    union {
+        struct {
+            file_t *file;           /*!< File to read/write from. */
+            unsigned offset : 20;   /*!< Location in the file in pages. */
+            unsigned size : 12;     /*!< Max bytes to read from the file - 1. */
+        } file_info;                /*!< Valid if hasfile is true. */
+        uintptr_t swap_slot;        /*!< Valid if hasfile and present are false. */
+    } data;
+};
+```
+
+-- Globals --
+
+- `frame_tbl`: A global frame table shared by all processes, since the
+underlying physical memory is shared.
+
+-- Static Variables --
+
+(All belong to the swap table.)
+- `occupied`: A bitmap tracking which swap slots are currently in use.
+- `lock`: A lock on the swap table to ensure that there aren't race conditions
+in finding and acquiring a swap slot.
+- `block`: The swap partition block device.
+
+---- ALGORITHMS ----
+
+>> A2: In a few paragraphs, describe your code for locating the frame,
+>> if any, that contains the data of a given page.
+
+We preserved the overall hardware functionality of the page table, by ensuring
+it's always up-to-date with our mappings (ie: if the present bit is true, the
+page table entry for a given page points to the frame which it is contained in).
+Therefore, any accesses to the data of a given page are handled by the page
+table and locate the appropriate frame, as expected.
+
+The page table is updated whenever we map a page into a frame, in order to
+preserve this functionality.
+
+>> A3: How does your code coordinate accessed and dirty bits between
+>> kernel and user virtual addresses that alias a single frame, or
+>> alternatively how do you avoid the issue?
+
+Initialization is done through the kernel, but our code is designed such that
+all subsequent user accesses are done through user virtual addresses, so the
+accessed and dirty bits for the user virtual address are always accurate to
+the user's interaction with it. (In particular, eg: the syscalls are set up
+to work this way.) The eviction policy uses the supplemental page table mappings
+corresponding to each frame in order to identify the status of its accessed bit
+for aging, and therefore also necessarily relies only on the accessed and dirty
+bits of the user virtual address. Thus, no other synchronization is necessary.
+
+---- SYNCHRONIZATION ----
+
+>> A4: When two user processes both need a new frame at the same time,
+>> how are races avoided?
+
+When a process indicates that it needs a new frame, the entire frame table is
+locked, causing other attempts to acquire or free frames to block.
+
+If eviction is necessary, we release the frame table lock, since the process
+of identifying a frame to evict via aging can happen synchronously. (We prevent
+data corruption by pinning the frames as we examine each of them, and otherwise
+the eviction algorithm is still effective.) It's then evicted by the
+supplemental page table, which locks the relevant mapping while it performs the
+eviction. When the frame is actually emptied, it briefly reacquires the frame
+table lock and pins the relevant frame in order to prevent data corruption
+there.
+
+At this point, the process hopes that eviction has succeeded, reacquires the
+frame table lock, and checks if there's an available frame. If not, it continues
+in this fashion until there is one. (Thus, it's valid for another process to
+``steal'' the frame from under a process, if both are attempting to acquire
+one.) Once it has a frame, it pins it to prevent it from being evicted, releases
+the frame table lock, and returns that frame.
+
+At this point, each process has successfully acquired a frame, with minimal
+synchronization overhead and without data corruption. (The frame is then
+unpinned by the function which requested it: usually the page fault handler.)
+
+---- RATIONALE ----
+
+>> A5: Why did you choose the data structure(s) that you did for
+>> representing virtual-to-physical mappings?
+
+We started by wanting to modify the page table to store all of the relevant
+data. There's a fair amount of space available there, since if the present bit
+is false, the address bits in each PTE can be validly modified to store other
+data, and the AVL bits can be used to indicate how to read each PTE (ie:
+whether the address represents a swap slot, a location in the disk, or an
+actual frame address). The bones of this structure are still preserved in our
+mappings in the supplemental page table: in particular, the single bits in
+`mapping_t` were the information stored in the AVL bits, and the union in
+`mapping_t` was the address bits.
+
+However, this presented absolutely wicked synchronization challenges. Without
+a supplemental page table, we couldn't lock any of the PTEs, so we had to
+carefully think of every possible race condition, and whether or not we could
+detect it and handle it. (For example: if you want to evict a page, and in
+the process of doing so, the page becomes dirty, the eviction should fail,
+and so on.) Although our implementation passed all but one test, it proved
+nearly impossible to debug that test. In the end, we decided to accept the
+memory overhead of having a supplemental page table, but still kept it as
+lightweight in memory as possible.
+
+After all, our original goal in reusing the PTE was to minimize the usage of
+memory, since an entry in the supplemental page table must be created for each
+page, of which there can be far more than the actual amount of physical memory.
+This led to the bit flags and hash map implementation of the mappings in the
+supplemental page table.
+
+Additionally, it simply seemed like the logical encapsulation to separate the
+frame table (corresponding to physical memory) from the supplemental page table
+(corresponding to virtual memory), so we always had that separated. Similarly,
+the swap table represents another kind of memory to interface with, so we
+broke it out too. The number of frames isn't known at compile-time, but look-up
+should be fast, so we made the frame table a flexible array. Look-up in the
+swap table is binary, is permitted to be slower, and could contain more entries,
+so we used a bitmap as the underlying data structure.
+
+		       PAGING TO AND FROM DISK
+		       =======================
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+See A1.
+
+---- ALGORITHMS ----
+
+>> B2: When a frame is required but none is free, some frame must be
+>> evicted.  Describe your code for choosing a frame to evict.
+
+We have implemented a variant of aging which also has a clock hand. Aging
+proceeds in a geometric manner relative to the time since the page was accessed,
+as is standard for that algorithm. The addition of the clock hand ensures
+an overall round robin structure subordinate to aging, to handle tie-breaking.
+The page with the smallest age is the one evicted. (Thus, if we encounter a page
+with an age of 0, we immediately select it, since there cannot be a better one.)
+
+>> B3: When a process P obtains a frame that was previously used by a
+>> process Q, how do you adjust the page table (and any other data
+>> structures) to reflect the frame Q no longer has?
+
+This occurs when P calls `palloc`, which instructs the frame table to find
+a frame. If an eviction is necessary, Q's supplemental page table is
+instructed to do so on the selected frame. Q's supplemental page table marks
+it as no longer present in the supplemental page table or page table. It then
+saves the page as indicated: to swap, disk, or removing it.
+
+(No other updates are necessary, since the supplemental page table captures
+memory as the user believes it to be.)
+
+Then, Q's supplemental page table instructs `palloc` to free the frame from the
+frame table. The frame table cleans the frame and marks it as unused. Now, the
+original `palloc` request is able to acquire the frame for P's usage.
+
+>> B4: Explain your heuristic for deciding whether a page fault for an
+>> invalid virtual address should cause the stack to be extended into
+>> the page that faulted.
+
+Our heuristic considers any page fault which is above the stack pointer,
+32 bytes below it, or 4 bytes below it to be an attempt to access the stack.
+The 32 byte and 4 byte values are due to the respective behaviors of PUSHA
+and PUSH, which access the stack in those prescribed steps. Additionally, any
+access above the stack pointer is clearly validly within the user's stack.
+
+However, this does come with the caveat that, if a page is `mmap`'d between the
+location of the fault above the stack pointer and the existing stack, we
+consider this to be invalid, since the stack cannot be validly extended through
+the `mmap` like that.
+
+---- SYNCHRONIZATION ----
+
+>> B5: Explain the basics of your VM synchronization design.  In
+>> particular, explain how it prevents deadlock.  (Refer to the
+>> textbook for an explanation of the necessary conditions for
+>> deadlock.)
+There are 4 classes of lock relevant to the project:
+ - Page locks, which lock the data of a single virtual memory supplemental
+   mapping.
+ - Frame locks, which are used to pin frames, preventing modification or
+   eviction.
+ - Global data structure locks, which are the file system lock and the frame
+   table lock or the kernel palloc pool lock.
+ - Device locks (for swap partition and internally in the file system)
+
+We avoid any issues with deadlocks from device locks by ensuring that pagefaults
+cannot occur inside a device by pinning any buffer passed to a device interface.
+Since no pagefault can occur, the thread holding the device lock can never
+attempt to acquire any other lock and so these are always the lowest level locks
+and we can ignore them.
+
+We avoid any deadlocks involving frame locks by never blocking on frame locks.
+Every frame lock is acquired via (the equivalent of) `lock_try_acquire`. If
+something strictly needs both a frame lock and a page lock, it must first pin
+the frame and only then attempt to acquire the page lock.
+
+Thus, the only possibility of deadlock is between the page locks and global
+data structure locks, or the global data structure locks.
+
+We avoid the file system lock deadlocking with anything the same way as the 
+underlying device locks: by ensuring that no page fault occurs between
+acquiring the lock and releasing it, thus ensuring that you can never interleave
+order of acquisition with anything else.
+
+Similarly, no thread holding the kernel palloc lock can ever page fault and thus
+no thread holding the kernel palloc lock can ever try to acquire any other lock.
+
+No code holding a page lock or the frame table lock can ever page fault because
+it never dereferences a user page. Thus, we only need to look at normal control
+flow. We only need to consider multithread interactions. The only time a thread
+will try to acquire a page lock from a supplemental page table that is not its
+own is when it is evicting another thread's page - in this case, the frame table
+lock is released before `vm_evict_page` is invoked - or when it is a timer
+interrupt for aging. The aging timer interrupt, however, as a timer interrupt,
+only attempts to use nonblocking operations and will simply skip over that page
+without updating its age if it is currently locked.
+Thus, no thread holding the frame table lock will every attempt to acquire any
+page lock and so there can never be a deadlock, even though code holding a page
+lock can try to acquire the frame table lock.
+
+>> B6: A page fault in process P can cause another process Q's frame
+>> to be evicted.  How do you ensure that Q cannot access or modify
+>> the page during the eviction process?  How do you avoid a race
+>> between P evicting Q's frame and Q faulting the page back in?
+Both evicting and loading a page require holding the page's page lock. Eviction
+acquires the page lock before it marks the page as not present, and it marks the
+page as not present before it cares about any writes to it. If Q tries to fault
+the page back in at this point, Q will block until P completes eviction.
+
+>> B7: Suppose a page fault in process P causes a page to be read from
+>> the file system or swap.  How do you ensure that a second process Q
+>> cannot interfere by e.g. attempting to evict the frame while it is
+>> still being read in?
+All frames returned by the frame table are atomically pinned (and thus cannot be
+evicted). The frame is the only unpinned once it is fully loaded in. Thus, no
+page in the process of being loaded or set up can ever be evicted.
+
+>> B8: Explain how you handle access to paged-out pages that occur
+>> during system calls.  Do you use page faults to bring in pages (as
+>> in user programs), or do you have a mechanism for "locking" frames
+>> into physical memory, or do you use some other design?  How do you
+>> gracefully handle attempted accesses to invalid virtual addresses?
+During system calls, we will lock frames into physical memory if necessary
+(if the system call involves accessing that memory while holding the file system
+lock) and otherwise simply use page faults to bring them in.
+
+So the buffer passed to "read()" will be pinned into physical memory while the
+command line passed to "exec()" will be paged in as necessary because it is
+copied into kernel memory anyway before it is ever passed into code that holds
+the file system lock.
+
+---- RATIONALE ----
+
+>> B9: A single lock for the whole VM system would make synchronization
+>> easy, but limit parallelism.  On the other hand, using many locks
+>> complicates synchronization and raises the possibility for deadlock
+>> but allows for high parallelism.  Explain where your design falls
+>> along this continuum and why you chose to design it this way.
+We used many locks and minimized the use of global locks where possible to
+increase parallelism and make the mutual exclusion in the code be limited to
+actual regions of semantic mutual exclusion.
+
+We chose to design it this way because ~~we hate ourselves and love suffering~~
+this maximizes parallelism (not that it really matters on one core) and
+minimizes context switching due to blocking.
+
+			 MEMORY MAPPED FILES
+			 ===================
+
+---- DATA STRUCTURES ----
+
+>> C1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+See A1.
+
+---- ALGORITHMS ----
+
+>> C2: Describe how memory mapped files integrate into your virtual
+>> memory subsystem.  Explain how the page fault and eviction
+>> processes differ between swap pages and other pages.
+There are places where file-backed pages and anonymous pages differ:
+ - loading
+ - eviction
+ - clean up
+In loading, a bit flag indicates that the page should be read from a file and
+offset stored in the mapping instead of filled with zeros or read from a swap
+slot.
+
+In eviction, you similarly read the bit flag. The key difference here is that
+a file-backed page becomes clean when you evict it, so if it is then loaded but
+not written to and evicted again, it can simply be destroyed rather than written
+anywhere. On the other hand, an anonymous page remains forever dirty since it
+has only a temporary swap slot allocation rather than a permanent file backing.
+
+In clean up, the main difference is that you need to write back to the file,
+rather than ignoring the contents, and then deal with the file object.
+
+>> C3: Explain how you determine whether a new file mapping overlaps
+>> any existing segment.
+When mapping a new file, all pages that will be mapped in are first checked
+for being mappable, which requires that they not be currently mapped and be
+below the stack pointer. Since each page would need to be mapped individually
+anyway (our system does not support mappings larger than one page), this
+pre-traversal was deemed much simpler than starting to map pages and then going
+back and clearing them all on failure.
+
+---- RATIONALE ----
+
+>> C4: Mappings created with "mmap" have similar semantics to those of
+>> data demand-paged from executables, except that "mmap" mappings are
+>> written back to their original files, not to swap.  This implies
+>> that much of their implementation can be shared.  Explain why your
+>> implementation either does or does not share much of the code for
+>> the two situations.
+Our implementation treats demand-paged executables the exact same way as mmapped
+file-backed pages until you attempt to evict a dirty page from a demand-paged
+executable. The moment you attempt to evict a dirty page executable page, it is
+converted instead to an anonymous mapping and uses the code for that from there.
+This means that demand-paged executables are a trivial code addition on top of
+file-backed pages and anonymous pages.
+
+			   SURVEY QUESTIONS
+			   ================
+
+Answering these questions is optional, but it will help us improve the
+course in future years.  Feel free to tell us anything you want - these
+questions are just to spur your thoughts.  Also, feel free to be completely
+honest if there are issues with the assignment or the course - you won't be
+penalized.  We can't fix things until we know about them.  :-)
+
+>> In your opinion, was this assignment, or any of the parts of it, too
+>> easy or too hard?  Did it take too long or too little time?
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+>> Were there any parts of the assignment that you felt were unnecessarily
+>> tedious or pointless?
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+>> Do you have any suggestions for the instructor and/or TAs to more
+>> effectively assist students, either for future quarters or the remaining
+>> projects?
+
+>> Any other comments?

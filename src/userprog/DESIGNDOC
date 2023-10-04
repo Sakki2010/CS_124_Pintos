@@ -1,0 +1,468 @@
+                     +--------------------------+
+                     |          CS 124          |
+                     | PROJECT 4: USER PROGRAMS |
+                     |     DESIGN DOCUMENT      |
+                     +--------------------------+
+
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Sahil Azad <sazad@caltech.edu>
+Winter Pearson <winter@caltech.edu>
+Yakov Shalunov <yakov@caltech.edu>
+
+>> Specify how many late tokens you are using on this assignment:
+
+0
+
+>> What is the Git repository and commit hash for your submission?
+   (You only need to include the commit-hash in the file you submit
+   on Moodle.)
+
+   Repository URL: https://github.com/caltech-cs124-2023sp/cs124-2023sp-seasons
+   commit ...
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please give them here.
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course instructors.
+
+			   USER PROGRAMS
+			   =============
+
+---- LOGISTICS ----
+
+These questions will help us to keep track of the difficulty level of
+assignments, as well as keeping track of which team members worked on
+which parts.
+
+>> L1: How many hours did each team member spend on this assignment?
+   Make sure that each member's total time is listed.
+
+- *Sahil:* 12 hours
+- *Winter:* 20 hours
+- *Yakov:* 6 hours
+
+>> L2: What did each team member focus on for this assignment?  Keep
+   descriptions to 25-30 words or less.
+
+- *Sahil:* General design; design of processes; argparsing; `exec` syscall
+- *Winter:* General design; implementation of file system syscalls and safe
+memory accesses; system call infrastructure
+- *Yakov:* General design; design of processes; implementation of children,
+orphans, and corpses; implementation of `wait` and `exec` syscalls
+
+                           ARGUMENT PASSING
+                           ================
+
+---- DATA STRUCTURES ----
+
+>> A1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+We made no such changes which are relevant to argparsing.
+
+---- ALGORITHMS ----
+
+>> A2: Briefly describe how you implemented argument parsing.  How do
+>> you arrange for the elements of argv[] to be in the right order?
+>> How do you avoid overflowing the stack page?
+
+We chose to make copy of the command-line input and pass that in to our
+thread_create function in order to preserve the command and the arguments
+passed in the correct order. We modified our setup_stack function to
+take the command-line input as a parameter, and using strtok_r, we
+split the input into the command and its args, stored in an array.
+We then iterated through the args array in inverse order, calculating
+the argument length and moving the stack pointer by the appropriate amount
+each time, and then pushing the arg onto the stack (this ensures argv elements
+are in correct order and pointers to argv elements are also in correct
+order). Each time we push the arg onto the stack, we store (in a secondary array)
+the stack pointer location.
+
+We then word align and repeat the process for the stack pointers before pushing argc
+and a fake return address, as laid out in the spec.
+
+To ensure stack page is not overflowed, each time the stack pointer is moved down and
+before memory is copied into the location of the esp pointer, the distance between the
+current esp pointer and PHYS_BASE is calculated and if that is larger than the
+size of a single page, then the page is freed, all allocated memory for the args
+is freed and the stack setup returns false (indicating failure).
+
+
+---- RATIONALE ----
+
+>> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+Because `strtok()` relies on global state, and thus is not safe in concurrent
+code. Since the Pintos kernel is concurrent, `strtok()` would not be safe.
+
+>> A4: In Pintos, the kernel separates commands into a executable name
+>> and arguments.  In Unix-like systems, the shell does this
+>> separation.  Identify at least two advantages of the Unix approach.
+
+It reduces the amount of work that has to be done in kernel space
+since arg parsing can be done in the shell and args can be validated in
+the shell before being passed to the kernel.
+
+                             SYSTEM CALLS
+                             ============
+
+---- DATA STRUCTURES ----
+
+>> B1: Copy here the declaration of each new or changed `struct' or
+>> `struct' member, global or static variable, `typedef', or
+>> enumeration.  Identify the purpose of each in 25 words or less.
+
+-- Types --
+
+We threw typedefs for brevity on more or less every type we were using:
+- `struct block` -> `block_t`
+- `struct intr_frame` -> `intr_frame_t`
+- `struct file` -> `file_t`
+- `struct hash_elem` -> `hash_elem_t`
+- `struct hash` -> `hash_t`
+- `struct hash_iterator` -> `hash_iterator_t`
+
+The thread struct was modified quite intensively. We've omitted the fields not
+modified.
+```c
+typedef struct thread {
+    /*! Owned by thread.c. */
+    /**@{*/
+    ...
+    hash_elem_t allelem;            /*!< Hash element for all threads hash. */
+    /**@}*/
+
+#ifdef USERPROG
+    /*! Owned by userprog/process.c. */
+    /**@{*/
+    ...
+    file_map_t file_map;            /*!< Map of filenos to file_t's. */
+    file_t *exec_file;              /*!< File being currently executed. */
+    uint32_t exit_code;             /*!< Exit code of the process. */
+    void *handle;                   /*!< Parent's handle for the child.
+                                         Owned by parent and NULL if orphan. */
+    list_t children;                /*!< List to look up children by pid. */
+    /**@{*/
+#endif
+   ...
+} thread_t;
+```
+- `file_map`: Map to convert file descriptors returned by system calls back to
+    kernel internal file objects.
+- `exec_file`: The executable file for the process. Held so that we can deny
+    writing to the file and then close at the end.
+- `exit_code`: The code with which the process exited with.
+- `handle`: The parent's handle for the child process, to be updated on exiting.
+- `children`: List of the thread's children.
+
+Maps integer file descriptors to file pointers. We compromised between speed and
+not setting limits on number of files by using an array and a list.
+```c
+/*! Represents a mapping between `file_t *`s and userspace `fd`s. */
+typedef struct file_map {
+    file_t *quick[NUM_QUICK_FILES];    /*!< Array of files for small fds
+                                                 since majority of programs will
+                                                 only open a couple files. */
+    list_t overflow;                        /*!< List to store arbitrary number
+                                                 of files beyond quick access. */
+    uint32_t first_open;                    /*!< First available file index slot
+                                                 (fi = fd - NUM_RESERVED_FDS). */
+} file_map_t;
+```
+- `quick`: First 8 files are accessed quickly by looking them up in an array.
+- `overflow`: Stores subsequent files in a list.
+- `first_open`: The first open value in the map for quicker insertion.
+
+This represents a function which a process could apply to each file
+corresponding to a file descriptor in its `file_map`.
+```c
+typedef void fm_action_func(file_t *, void *);
+```
+
+Subtype for file_map_t. Used to hold files in the overflow list.
+```c
+/*! Struct for storing files in the overflow list. */
+typedef struct {
+    file_t *f;              /*!< File to store. */
+    list_elem_t elem;       /*!< Intrusive list element. */
+    uint32_t fi;            /*!< The file index, which is the file descriptor
+                                 minus the number of reserved file descriptors. */
+} file_elem_t;
+```
+
+Handle for a child. Used to hold a small corpse and allow exiting processes to
+free memory immediately. Provides a semaphore to synchronize wait.
+```c
+/*! Child registry for a parent. */
+typedef struct child {
+    list_elem_t elem;       /*!< List element to put in children list of parent. */
+    tid_t tid;              /*!< Pid of the child. */
+    semaphore_t exit;       /*!< Semaphore which starts at 0 and is upped when
+                                 the process exits. */
+    int exit_code;          /*!< Exit code of the child.
+                                 Invalid until exit is upped. */
+} child_t;
+```
+
+Struct for process_execute to pass to process_start through thread_create.
+```c
+/*! Info a child process needs to start. */
+typedef struct start_info {
+    child_t *child;         /*!< The parent's child registry. */
+    char *command;          /*!< The full command line to execute. */
+    semaphore_t start;      /*!< Semaphore starting at 0 which process should up
+                                 when it finishes starting (successfully or not)*/
+    bool success;           /*!< Whether the process succeeded in starting.
+                                 Invalid until start has been upped. */
+} start_info_t;
+```
+
+We added structs to allow future support of using a readers-writer lock for file
+system access, if prefered once we start the file system project.
+```c
+typedef lock_t rwlock_t;
+typedef enum {RW_UNLOCKED, RW_READ, RW_WRITE} rwlock_state_t;
+```
+
+-- Globals --
+
+- `fs_lock` added, which is a global lock to prevent race conditions on access
+to the file system.
+- `static list_t all_list` changed to `static hash_t all_hash`, as part of
+implementing thread look-up by `tid` via hash table.
+- `MAX_PRINT` is a constant for max characters to print to the console per
+buffer.
+
+>> B2: Describe how file descriptors are associated with open files.
+>> Are file descriptors unique within the entire OS or just within a
+>> single process?
+File descriptors are associated with open files via each process's file_map.
+They are unique only to a single process, which would be necessary if we were
+implementing `fork()`.
+
+---- ALGORITHMS ----
+
+>> B3: Describe your code for reading and writing user data from the
+>> kernel.
+
+We decided to implement the quicker way to access user data from the kernel,
+as described in the spec. First, we took the provided functions (which became
+`_get_user()` and `_set_user()`, respectively) and added them to `syscall.c`.
+Additionally, we modified the page fault handler so that, if the page fault was
+caused by the kernel, instead of reporting this and killing the thread, it
+returns -1 via eax and triggers the special assembly in those functions.
+
+These were then wrapped in helper functions which checked the pointer was in
+user space (`get_user_8()` and `set_user()`). Additionally, a `get_user_32()`
+function was added to read an entire word size from user space, one byte at a
+time, and then package the result to return it, since this was a process
+required for many syscalls.
+
+>> B4: Suppose a system call causes a full page (4,096 bytes) of data
+>> to be copied from user space into the kernel.  What is the least
+>> and the greatest possible number of inspections of the page table
+>> (e.g. calls to pagedir_get_page()) that might result?  What about
+>> for a system call that only copies 2 bytes of data?  Is there room
+>> for improvement in these numbers, and how much?
+The least and greatest possible number of inspections is 1 and 2 respectively
+both, depending whether the data goes across a page boundary. Each page touched
+by the buffer is checked exactly once. There is no room for improvement since
+you always have to check whether each page is mapped and we are checking each
+page at most once.
+
+>> B5: Briefly describe your implementation of the "wait" system call
+>> and how it interacts with process termination.
+`wait()` first looks up the given `pid` in the process's list of children. If it
+fails to find the handle (which occurs only if the `pid` was not returned by
+`exec`), it returns -1. Otherwise, it downs the semaphore in the handle and once
+it unblocks, reads the `exit_code` writen to the handle and frees the handle.
+
+On terminating, a process which has not been orphaned will write to the
+`exit_code` field of the handle and then up the semaphore.
+
+>> B6: Any access to user program memory at a user-specified address
+>> can fail due to a bad pointer value.  Such accesses must cause the
+>> process to be terminated.  System calls are fraught with such
+>> accesses, e.g. a "write" system call requires reading the system
+>> call number from the user stack, then each of the call's three
+>> arguments, then an arbitrary amount of user memory, and any of
+>> these can fail at any point.  This poses a design and
+>> error-handling problem: how do you best avoid obscuring the primary
+>> function of code in a morass of error-handling?  Furthermore, when
+>> an error is detected, how do you ensure that all temporarily
+>> allocated resources (locks, buffers, etc.) are freed?  In a few
+>> paragraphs, describe the strategy or strategies you adopted for
+>> managing these issues.  Give an example.
+
+We approached this from two angles. First, we wrapped all accesses to user
+program memory in descriptive helper functions which handled error parsing
+themselves, and gave those functions the right to kill the user process if the
+pointer was sufficiently malformed, or otherwise return well-defined error
+codes. This abstracts away the error handing in each syscall to be a single
+function call.
+
+Relatedly, we adopted the approach of validating the entire space which we
+were going to work with before acquiring any resources to perform the syscall.
+Therefore, each syscall begins with a function for the relevant validation
+(usually `verify_buffer()` or `valid_str_len()`). Finally, before switching into
+the relevant syscall, we verify that we can access each argument (and the
+syscall number) provided on the stack.
+
+Since we don't acquire any resources before potentially terminating a process,
+we don't have to be concerned about freeing them on failure and can simply
+terminate directly. (The process's resources are always closed by
+`process_cleanup()` and are therefore also not the concern of the syscall.)
+This is also better style in that it decreases competition for the file
+system lock.
+
+For example, if a "write" syscall was performed with a null buffer, the syscall
+handler would first attempt a safe get of the syscall number, and identify that
+it had succeeded. It would then switch into the case for the write syscall,
+attempt a safe get of each of the arguments for it, identify that each of these
+were accessible, and therefore pass them on to `sys_write()`. It would then
+attempt to verify the provided buffer by trying to read from each page in it
+via `get_user8()`. This would check that the address was in user space (which
+`0x0` is), and on success, would attempt a read. This would cause a page
+fault, which would be caught by the pagefault handler, and safely return an
+error as discussed above. This would cause `get_user8()` to return an error,
+which would propogate back to `sys_write()`, who would kill the user process
+without having ever acquired the lock for the file system or any other
+resources.
+
+---- SYNCHRONIZATION ----
+
+>> B7: The "exec" system call returns -1 if loading the new executable
+>> fails, so it cannot return before the new executable has completed
+>> loading.  How does your code ensure this?  How is the load
+>> success/failure status passed back to the thread that calls "exec"?
+Exec initializes a semaphore at 0 and passes it to the starting process via
+`thread_create` as part of the `start_info_t` struct, which also contains a
+success field. Before it returns, `exec` downs the semaphore and then reads the
+success field. Before it initializes the process, `process_start()` sets the
+success field and ups the semaphore.
+
+>> B8: Consider parent process P with child process C.  How do you
+>> ensure proper synchronization and avoid race conditions when P
+>> calls wait(C) before C exits?  After C exits?  How do you ensure
+>> that all resources are freed in each case?  How about when P
+>> terminates without waiting, before C exits?  After C exits?  Are
+>> there any special cases?
+- `wait(C)` before exit: P downs a semaphore in the handle, which C ups whenever
+    it does exit.
+- `wait(C)` after exit: C will have already upped the semaphore, so P downs it
+    without blocking.
+- Terminate without `wait()`: Process exit calls `orphan_children()`
+    in its cleanup, which sets the handle fields of all its (still living)
+    children to `NULL` and frees the handles (regardless of whether the child is
+    still living).
+To avoid TOCTOU issues between checking whether the handle is still non-`NULL`
+between `orphan_children()` and the child modifying its handle,
+`orphan_children()` and `process_cleanup()` disable interrupts to make
+the action atomic. Done this way because the operations inside the disabled
+interrupts are very fast (setting a couple words of memory) or require disabling
+interrupts anyway (upping a semaphore, looking up if a child is still alive),
+so the amount of extra time spent with interrupts is negligible in exchange for
+greatly reduced complexity and increased memory efficiency of trying to do an
+atomic referencing cell with locks and semaphores.
+
+---- RATIONALE ----
+
+>> B9: Why did you choose to implement access to user memory from the
+>> kernel in the way that you did?
+
+Between the options of verifying the pointer and then dereferencing it, versus
+dereferencing it and catching a page fault, we decided on the latter. First,
+this will, by definition, catch all possible ways in which a page fault
+could be triggered, without requiring us to identify all of them before
+dereferencing a pointer and potentially missing some of them. We believed it
+more accurately captured the intended functionality of the code and was
+therefore cleaner. (Indeed, testing was very straightforward and successful
+having used this approach.)
+
+Additionally, the time speedup provided by the use of the processor's MMU was
+appealing, as well as the adherence to design principles used by real kernels,
+as described in the spec. Learning about the functionality of real kernels by
+implementing parts of them is a significant part of the appeal of this class
+for us as well, and so it seemed the strictly better option of the two.
+
+>> B10: What advantages or disadvantages can you see to your design
+>> for file descriptors?
+Aside from the theoretical necessity of allowing multiple processes to have
+the same file descriptor refer to distinct objects in the kernel to implement
+`fork()` (which we don't have to), the main advantage of making a map of file
+descriptors to file objects is that it is much easier to check whether a file
+descriptor passed in is valid at all and whether it belongs to the user.
+
+The only disadvantage is speed.
+
+>> B11: The default tid_t to pid_t mapping is the identity mapping.
+>> If you changed it, what advantages are there to your approach?
+We did not change it.
+
+			  SURVEY QUESTIONS
+			  ================
+
+Answering these questions is optional, but it will help us improve the
+course in future years.  Feel free to tell us anything you want - these
+questions are just to spur your thoughts.  Also, feel free to be completely
+honest if there are issues with the assignment or the course - you won't be
+penalized.  We can't fix things until we know about them.  :-)
+
+>> In your opinion, was this assignment, or any of the parts of it, too
+>> easy or too hard?  Did it take too long or too little time?
+
+- *Sahil:* The assignment was pretty well balanced in difficulty, debugging the
+tests took quite a bit of time but the tools given (especially hexdump for
+argparsing) alleviated the difficulty.
+- *Winter:* No, not particularly! If anything, this was a nice project to
+have for midterms week, since it was conceptually straightforward, relatively
+easy to test, and not too much code to write. I think it was a well-balanced
+choice of project.
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+- *Sahil:* The argparsing and syscall part of the assignment were interesting
+and the overall assignment as a whole provided quite a bit of insight into how
+userspace programs were handled by an OS.
+- *Winter:* I particularly enjoyed rewriting the page fault handler to return
+a value to the kernel instead. I'd not considered that approach to validating
+a pointer in userspace.
+
+>> Were there any parts of the assignment that you felt were unnecessarily
+>> tedious or pointless?
+
+- *Sahil:* No, nothing seemed pointless.
+- *Winter:* The bulk of the work for argparsing for us was about how to
+properly manage the strings when parsing them, as opposed to organizing
+them effectively on the stack (which felt like the more insightful part of
+that section of the project). I didn't feel like I gained a great deal of
+insight from that, although I'm fine with the fact that we had to do it, it
+wasn't *that* tedious.
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+- *Winter:* I would have appreciated clearer documentation for `hex_dump()`,
+as it wasn't particularly clear how to effectively select arguments for it
+to make it print as expected.
+
+>> Do you have any suggestions for the instructor and/or TAs to more
+>> effectively assist students, either for future quarters or the remaining
+>> projects?
+
+- *Winter:* No, not particularly! The elaboration in class about what
+`multi_oom` was testing for was interesting. (We didn't have issues with it
+ourselves, but I think it would have helped if we had.)
+
+>> Any other comments?
+

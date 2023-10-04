@@ -1,0 +1,218 @@
+			+------------------+
+			|      CS 124      |
+			| PROJECT 1: SHELL |
+			|  DESIGN DOCUMENT |
+			+------------------+
+				   
+---- GROUP ----
+
+>> Fill in the names and email addresses of your group members.
+
+Sahil Azad <sazad@caltech.edu>
+Winter Pearson <winter@caltech.edu>
+Yakov Shalunov <yakov@caltech.edu>
+
+>> Specify how many late tokens you are using on this assignment:  
+
+0
+
+>> What is the Git repository URL and commit hash for your submission?
+   (You only need to include the commit-hash in the file you submit
+   on Moodle.)
+
+   Repository URL: https://github.com/caltech-cs124-2023sp/cs124-2023sp-seasons
+   commit ...
+
+---- PRELIMINARIES ----
+
+>> If you have any preliminary comments on your submission, notes for the
+>> TAs, or extra credit, please include them here.
+
+1. We have implemented all extra credit
+
+>> Please cite any offline or online sources you consulted while
+>> preparing your submission, other than the Pintos documentation, course
+>> text, lecture notes, and course instructors.
+
+- `man` pages
+- Stack Overflow
+- [`readline` documentation](https://man7.org/linux/man-pages/man3/readline.3.html)
+- [GNU history library documentation](https://tiswww.case.edu/php/chet/readline/history.html)
+
+			   COMMAND SHELL
+			   =============
+
+---- LOGISTICS ----
+
+These questions will help us to keep track of the difficulty level of
+assignments, as well as keeping track of which team members worked on
+which parts.
+
+>> L1: How many hours did each team member spend on this assignment?
+   Make sure that each member's total time is listed.
+
+- *Sahil:* 8 hours
+- *Winter:* 10 hours
+- *Yakov:* 11 hours
+
+>> L2: What did each team member focus on for this assignment?  Keep
+   descriptions to 25-30 words or less.
+
+- *Sahil:* Overall design, redirects, spawning sub-processes, running in background with `&`
+- *Winter:* Overall design, lexer, pipes, non-`history` built-ins, opening and closing files, stream duplication with `>&`
+- *Yakov:* Overall design, tokenizer, pipe proptotyping, file descriptor management, `history` built-in and other `readline` work, signal handling, running in background with `&`
+
+---- DATA STRUCTURES ----
+
+>> A1: Describe how your command shell manages parsing and executing
+>> commands that contain arguments and pipes, using the example
+>> command "a arg1 arg2 | b arg1 | c arg1 arg2 arg3".  How does your
+>> shell internally represent such a command?
+
+First, commands are tokenized. The tokens are `WORD`s, representing commands or their arguments, and a variety of tokens representing data controls (`>`, `<`, `|`, etc). The example command would become the list
+
+`[WORD(a), WORD(arg1), WORD(arg2), PIPE, WORD(b), WORD(arg1), PIPE, WORD(arg1), WORD(arg2), WORD(arg3), END]`
+
+The lexer then converts this into our chosen internel representation, which is a tree of nodes representing the flow of data, where each node either represents a command or a file. Commands have pointers to other nodes representing STDIN, STDOUT, and STDERR, and the respective streams are pulled from or routed to those destinations. Each command node stores its arguments as a `NULL`-terminated array of strings. There are also special nodes to represent input from or output to the shell.
+
+Thus, this would become
+
+`command1 {`
+`	path: a`
+`	args: a, arg1, arg2`
+`	stdin: SHELLIN`
+`	stderr: SHELLOUT`
+`	stdout: command2`
+`}`
+
+`command2 {`
+`	path: b`
+`	args: b, arg1`
+`	stdin: command1`
+`	stderr: SHELLOUT`
+`	stdout: command3`
+`}`
+
+`command3 {`
+`	path: c`
+`	args: c, arg1, arg2, arg3`
+`	stdin: command2`
+`	stderr: SHELLOUT`
+`	stdout: SHELLOUT`
+`}`
+
+>> A2: Now, given the command:
+>> "a arg1 arg2 < inp.txt | b arg1 | c arg1 arg2 arg3 > out.txt"
+>> Briefly explain specifically how the redirections are parsed and
+>> represented, and by what processes.
+
+During tokenization, the redirection symbols themselves (as well as what stream they are redirecting, whether they are appending or overwriting, etc.) become tokens.
+
+When lexing, these tokens then govern the construction of file nodes in the AST.
+
+After the child processes are forked off, they then open the given pathes and set the resulting file descriptors in place of stdin, stdout, or stderr as appropriate. Thus, file opening is done by child processes.
+
+---- ALGORITHMS ----
+
+>> A3: Illustrate how you solved the problem of setting up
+>> redirection in a simple command like "a < inp.txt > out.txt", by
+>> describing what process takes care of the redirection and when.
+
+The redirection is done in the child process after it is forked off but before it runs `execvp` to replace itself with the command the user asked for. The child has access to the file paths and `open`s them, using `dup2` to overwrite `stdin`/`stdout`/`stderr` as necessary, before `clos`ing the original file descriptors to avoid leakage.
+
+>> A4: Illustrate how you solved the problem of setting up the pipes
+>> between multiple operations in a single command, by describing
+>> what each process is responsible for.  For example, given the
+>> command "a | b | c", describe the sequence of steps in setting up
+>> the processes and their pipes, starting with your command shell's
+>> process, and going through the execution of programs a, b and c.
+>> Keep your description of each process' responsibilities limited to
+>> ~25 words or less.
+
+Shell/parent process: Creates and saves 2 pipes. Pipe ends are passed to the processing spawning function. Pipe 1 closes after forking `b` and same for 2/`c`.
+
+Process `a`: Closes the read end of pipe 1, uses `dup2` to set `stdout` to the write end, then closes the write end.
+
+Process `b`: Same as `a` for pipe 2, and the inverse for pipe 1, closing the write end and replacing `stdin` by the read end.
+
+Process `c`: Does to pipe 2 what `b` does to pipe 1.
+
+>> A5: Similarly, describe the details of how terminated processes are
+>> reaped in the example command "a | b | c".
+
+When the processes are created, their pids are all added to an array. Then, the shell waits on all the pids in the array.
+
+>> A6: Similarly, describe which processes are responsible for setting
+>> up the redirections in the example command
+>> "a < inp.txt | b | c > out.txt".
+
+The processes `a` and `c` access `inp.txt` and `out.txt` as strings and create files, overwriting their standard in and standard out file descriptors before they call `execvp`.
+
+---- RATIONALE ----
+
+>> A7: Why must the chdir and exit commands be implemented as built-in
+>> functions, rather than external programs?
+
+While `exit` could technically be an externel program (it could send a signal to the shell using `getppid()` to get the shell's pid), it would be messy and make allowing the shell to do cleanup much harder. The command `chdir` needs to change the internal state of the shell (what directory it's operating in), and so would be almost impossible to do through an external command.
+
+Broadly, since they affect the internal state of the shell, they need to be handled by the shell directly.
+
+>> A8: Why did you ultimately choose this design?  In what ways is it
+>> superior to other designs you considered as you developed your solution?
+
+Our choice of internel representation was motivated by considering the extra credit from the start. We decided that a tree representing the (potentially brnaching) flow of data was the most natural way to structure the project. In retrospect, the tree is perhaps unnecessarily expressive, but it was a reasonable choice and feels very natural to us.
+
+In terms of how to actually spawn the commands, we chose to implement things such that file descriptors only exist where strictly necessary. Thus, files are opened after forking, since the parent shell has no need to see them, while pipes are opened by the shell because the same pipe needs to be accessible by multiple children.
+
+>> A9: Did you take any steps to facilitate development of the command
+>> shell in parallel, e.g. designing shared data structures or integration
+>> points up front?  How well did your approach work for your team?  Feel
+>> free to share any positive or negative experiences in this vein.
+
+After we worked out our designs, our first step was to agree on and write all the header files. Once the header files were all written, we could easily distribute implementation duties. Our approach worked very well---all of us always had something to do while we were working together and nobody was ever waiting for a task. When we implemented our initial tasks, we made a TODO list to work from.
+
+
+			  SURVEY QUESTIONS
+			  ================
+
+Answering these questions is optional, but it will help us improve the
+course in future years.  Feel free to tell us anything you want - these
+questions are just to spur your thoughts.  Also, feel free to be completely
+honest if there are issues with the assignment or the course - you won't be
+penalized.  We can't fix things until we know about them.  :-)
+
+>> In your opinion, was this assignment, or any of the parts of it, too
+>> easy or too hard?  Did it take too long or too little time?
+
+- Winter: It seemed like a reasonable introductory project, in terms of time, topic, and scope. While it didn't feel particularly harder or more insightful than CS 24, I was also glad not to have to grapple with the entire `pintos` setup in the first week, so I'm alright with that trade-off!
+- Yakov: The parsing/lexing of the inputs took up over half our total time and also felt entirely uninteresting, routine, and pointless. I think the project would be better off providing starter code for the parsing and making some, or all, of the current extra credit mandatory to compensate.
+- Sahil: The project seemed to be quite balanced in difficulty for an introductory project. Much of the work done regarding system calls and managing streams, pipes and redirection was interesting to delve into given that CS 24 only provided a brief overview of those topics.
+
+>> Did you find that working on a particular part of the assignment gave
+>> you greater insight into some aspect of OS design?
+
+- Winter: Definitely working with and thinking about pipes. (For that, I particularly appreciated [the section on `pipe()` functionality](http://users.cms.caltech.edu/~donnie/cs124/pintos_2.html#SEC32), as well as [the guidance for how shells work](http://users.cms.caltech.edu/~donnie/cs124/pintos_2.html#SEC16).) Background processes were also interesting! 
+- Yakov: Implementing a prototype piping redirect.
+- Sahil: Understanding the parallelism involved in pipes and how process were run in the shell when piped together.
+
+>> Were there any parts of the assignment that you felt were unnecessarily
+>> tedious or pointless?
+
+- Winter: I'm surprised that this class, which seems broadly interested in allowing us freedom of design, enforces relatively detailed [style guidelines](http://users.cms.caltech.edu/~donnie/cs124/pintos_9.html#SEC159), such as an 80-character limit for C files and four-space indenting instead of tabs. I'm not clear why these are important, especially since they're not ones which I agree are better style!
+- Yakov: Everything related to string parsing.
+- Sahil: Much of the initial setup to get the VM working (though that may have been due to my specific computer and its setup) was quite convoluted and seemed like it could have been streamlined.
+
+>> Is there some particular fact or hint we should give students in
+>> future quarters to help them solve the problems?  Conversely, did you
+>> find any of our guidance to be misleading?
+
+- Winter: A number of aspects of how our shell should respond to unusual edge cases weren't addressed by the spec, and we had to deduce them by running zsh and bash. If the intention was for us to simply pick something reasonable, it'd be helpful to have that clarified, as well as a sense of what constitutes a "reasonable" implementation!
+- Yakov: Providing links to the `readline` and corresponding `history` documentation could be helpful as it was somewhat annoying to track down.
+- Sahil: Reasonable methods to approach background processes may help given that the one hint (sigchild handlers) wasn't necessarily required for background process handling.
+
+>> Do you have any suggestions for the instructor and/or TAs to more
+>> effectively assist students, either for future quarters or the remaining
+>> projects?
+
+>> Any other comments?
+

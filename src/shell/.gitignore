@@ -1,0 +1,7 @@
+mysh
+util
+cattysleep
+outerr
+sleepycat
+*.o
+*mysh_history
